@@ -23,15 +23,22 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
     super.initState();
     _load();
     DownloadService.actives.addListener(_onActivesChanged);
+    DownloadLibraryService.instance.updates.addListener(_onLibraryUpdated);
   }
   @override
   void dispose() {
     DownloadService.actives.removeListener(_onActivesChanged);
+    DownloadLibraryService.instance.updates.removeListener(_onLibraryUpdated);
     super.dispose();
   }
+  void _onLibraryUpdated() {
+    if (mounted) _load();
+  }
   void _onActivesChanged() {
-    if (mounted) setState(() {});
-    if (DownloadService.actives.value.isEmpty) _load();
+    if (mounted) {
+      setState(() {});
+      _load();
+    }
   }
   Future<void> _load() async {
     await DownloadService.syncWithPublicFolder();

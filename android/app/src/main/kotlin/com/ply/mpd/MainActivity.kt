@@ -417,6 +417,8 @@ class MainActivity : FlutterActivity() {
                 val bufSize = 2 * 1024 * 1024
                 val buf = ByteBuffer.allocate(bufSize)
                 val info = MediaCodec.BufferInfo()
+                var lastVideoPts = -1L
+                var lastAudioPts = -1L
 
                 if (audioTrackIn >= 0 && audioTrackOut >= 0 && audioExtractor != null) {
                     videoExtractor.selectTrack(videoTrackIn)
@@ -428,21 +430,33 @@ class MainActivity : FlutterActivity() {
                         val audioTime = if (!audioDone) audioExtractor.sampleTime else Long.MAX_VALUE
 
                         if (!videoDone && (audioDone || videoTime <= audioTime)) {
+                            info.offset = 0
                             info.size = videoExtractor.readSampleData(buf, 0)
                             if (info.size < 0) {
                                 videoDone = true
                             } else {
-                                info.presentationTimeUs = videoExtractor.sampleTime
+                                var pts = videoExtractor.sampleTime
+                                if (pts <= lastVideoPts) {
+                                    pts = lastVideoPts + 1000L
+                                }
+                                lastVideoPts = pts
+                                info.presentationTimeUs = pts
                                 info.flags = videoExtractor.sampleFlags
                                 muxer.writeSampleData(videoTrackOut, buf, info)
                                 videoExtractor.advance()
                             }
                         } else if (!audioDone) {
+                            info.offset = 0
                             info.size = audioExtractor.readSampleData(buf, 0)
                             if (info.size < 0) {
                                 audioDone = true
                             } else {
-                                info.presentationTimeUs = audioExtractor.sampleTime
+                                var pts = audioExtractor.sampleTime
+                                if (pts <= lastAudioPts) {
+                                    pts = lastAudioPts + 1000L
+                                }
+                                lastAudioPts = pts
+                                info.presentationTimeUs = pts
                                 info.flags = audioExtractor.sampleFlags
                                 muxer.writeSampleData(audioTrackOut, buf, info)
                                 audioExtractor.advance()
@@ -452,9 +466,15 @@ class MainActivity : FlutterActivity() {
                 } else {
                     videoExtractor.selectTrack(videoTrackIn)
                     while (true) {
+                        info.offset = 0
                         info.size = videoExtractor.readSampleData(buf, 0)
                         if (info.size < 0) break
-                        info.presentationTimeUs = videoExtractor.sampleTime
+                        var pts = videoExtractor.sampleTime
+                        if (pts <= lastVideoPts) {
+                            pts = lastVideoPts + 1000L
+                        }
+                        lastVideoPts = pts
+                        info.presentationTimeUs = pts
                         info.flags = videoExtractor.sampleFlags
                         muxer.writeSampleData(videoTrackOut, buf, info)
                         videoExtractor.advance()

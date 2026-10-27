@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:gal/gal.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -529,6 +530,15 @@ class DownloadService {
               false;
         } on PlatformException catch (e) {
           muxError = e.message ?? e.code;
+        } catch (e) {
+          muxError = e.toString();
+        }
+        if (!muxed) {
+          // Fallback: If muxing fails, copy video directly so user never loses downloaded video
+          try {
+            await File(stagedVideoPath).copy(outputPath);
+            muxed = true;
+          } catch (_) {}
         }
       }
 
@@ -578,75 +588,128 @@ class DownloadService {
     return docs.path;
   }
   static Future<Directory> _downloadsDirectory() async {
-    final root = await _publicPlyRoot();
-    final dir = Directory('$root/Ply/Ply Videos');
+    if (Platform.isAndroid) {
+      try {
+        final ext = await getExternalStorageDirectory();
+        if (ext != null) {
+          final root = ext.path.split('/Android/').first;
+          final pubDir = Directory('$root/Ply/Ply Videos');
+          try {
+            if (!await pubDir.exists()) await pubDir.create(recursive: true);
+            final probe = File('${pubDir.path}/.probe');
+            await probe.writeAsString('1');
+            await probe.delete();
+            return pubDir;
+          } catch (_) {}
+          final appExtDir = Directory('${ext.path}/Ply Videos');
+          if (!await appExtDir.exists()) await appExtDir.create(recursive: true);
+          return appExtDir;
+        }
+      } catch (_) {}
+    }
+    final docs = await getApplicationDocumentsDirectory();
+    final dir = Directory('${docs.path}/Ply Videos');
     if (!await dir.exists()) await dir.create(recursive: true);
     return dir;
   }
   static Future<Directory> _persistentTempDirectory() async {
-    final root = await _publicPlyRoot();
-    final dir = Directory('$root/Ply/.incomplete');
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
+    try {
+      final temp = await getTemporaryDirectory();
+      final dir = Directory('${temp.path}/.incomplete');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir;
+    } catch (_) {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/.incomplete');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir;
+    }
   }
   static Future<Directory> _thumbnailsDirectory() async {
-    final root = await _publicPlyRoot();
-    final dir = Directory('$root/Ply/thumbnails');
-    if (!await dir.exists()) await dir.create(recursive: true);
-    return dir;
+    try {
+      final docs = await getApplicationDocumentsDirectory();
+      final dir = Directory('${docs.path}/thumbnails');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir;
+    } catch (_) {
+      final temp = await getTemporaryDirectory();
+      final dir = Directory('${temp.path}/thumbnails');
+      if (!await dir.exists()) await dir.create(recursive: true);
+      return dir;
+    }
   }
   static Future<void> syncWithPublicFolder() async {
     try {
-      final dir = await _downloadsDirectory();
-      if (!await dir.exists()) return;
-      final existing = await DownloadLibraryService.instance.loadAll();
-      final existingPaths = existing.map((e) => e.filePath).toSet();
-      final files = dir
-          .listSync()
-          .whereType<File>()
-          .where((f) {
-            final p = f.path.toLowerCase();
-            return p.endsWith('.mp4') ||
-                p.endsWith('.mkv') ||
-                p.endsWith('.webm');
-          })
-          .toList();
-      for (final file in files) {
-        if (existingPaths.contains(file.path)) continue;
-        final name = file.uri.pathSegments.last;
-        final title =
-            name.contains('.') ? name.substring(0, name.lastIndexOf('.')) : name;
-        final id = 'scan_${file.path.hashCode.abs()}';
-        int durationMs = 0;
+      final dirsToScan = <Directory>[];
+      final currentDir = await _downloadsDirectory();
+      dirsToScan.add(currentDir);
+      if (Platform.isAndroid) {
         try {
-          final ctrl = VideoPlayerController.file(file);
-          await ctrl.initialize();
-          durationMs = ctrl.value.duration.inMilliseconds;
-          await ctrl.dispose();
-        } catch (_) {}
-        String? thumbnailPath;
-        try {
-          final thumbsDir = await _thumbnailsDirectory();
-          final candidatePath = '${thumbsDir.path}/$id.jpg';
-          final ok = await _mediaChannel.invokeMethod<bool>('thumbnail', {
-                'videoPath': file.path,
-                'outputPath': candidatePath,
-                'timeUs': 1000000,
-              }) ??
-              false;
-          if (ok && await File(candidatePath).exists()) {
-            thumbnailPath = candidatePath;
+          final ext = await getExternalStorageDirectory();
+          if (ext != null) {
+            final root = ext.path.split('/Android/').first;
+            final pubDir = Directory('$root/Ply/Ply Videos');
+            if (await pubDir.exists() && pubDir.path != currentDir.path) {
+              dirsToScan.add(pubDir);
+            }
+            final appExtDir = Directory('${ext.path}/Ply Videos');
+            if (await appExtDir.exists() && appExtDir.path != currentDir.path) {
+              dirsToScan.add(appExtDir);
+            }
           }
         } catch (_) {}
-        await DownloadLibraryService.instance.add(DownloadRecord(
-          id: id,
-          title: title,
-          filePath: file.path,
-          durationMs: durationMs,
-          thumbnailPath: thumbnailPath,
-          isDash: false,
-          downloadedAtMs: file.statSync().modified.millisecondsSinceEpoch,
-        ));
+      }
+      final existing = await DownloadLibraryService.instance.loadAll();
+      final existingPaths = existing.map((e) => e.filePath).toSet();
+      for (final dir in dirsToScan) {
+        if (!await dir.exists()) continue;
+        final files = dir
+            .listSync()
+            .whereType<File>()
+            .where((f) {
+              final p = f.path.toLowerCase();
+              return p.endsWith('.mp4') ||
+                  p.endsWith('.mkv') ||
+                  p.endsWith('.webm');
+            })
+            .toList();
+        for (final file in files) {
+          if (existingPaths.contains(file.path)) continue;
+          final name = file.uri.pathSegments.last;
+          final title =
+              name.contains('.') ? name.substring(0, name.lastIndexOf('.')) : name;
+          final id = 'scan_${file.path.hashCode.abs()}';
+          int durationMs = 0;
+          try {
+            final ctrl = VideoPlayerController.file(file);
+            await ctrl.initialize();
+            durationMs = ctrl.value.duration.inMilliseconds;
+            await ctrl.dispose();
+          } catch (_) {}
+          String? thumbnailPath;
+          try {
+            final thumbsDir = await _thumbnailsDirectory();
+            final candidatePath = '${thumbsDir.path}/$id.jpg';
+            final ok = await _mediaChannel.invokeMethod<bool>('thumbnail', {
+                  'videoPath': file.path,
+                  'outputPath': candidatePath,
+                  'timeUs': 1000000,
+                }) ??
+                false;
+            if (ok && await File(candidatePath).exists()) {
+              thumbnailPath = candidatePath;
+            }
+          } catch (_) {}
+          await DownloadLibraryService.instance.add(DownloadRecord(
+            id: id,
+            title: title,
+            filePath: file.path,
+            durationMs: durationMs,
+            thumbnailPath: thumbnailPath,
+            isDash: false,
+            downloadedAtMs: file.statSync().modified.millisecondsSinceEpoch,
+          ));
+        }
       }
     } catch (_) {}
   }
@@ -689,6 +752,9 @@ class DownloadService {
       isDash: isDash,
       downloadedAtMs: DateTime.now().millisecondsSinceEpoch,
     ));
+    try {
+      await Gal.putVideo(filePath);
+    } catch (_) {}
   }
 
   static Future<void> _downloadToFile(

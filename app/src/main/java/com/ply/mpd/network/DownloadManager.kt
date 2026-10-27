@@ -333,7 +333,14 @@ class DownloadManager private constructor(private val context: Context) {
 
         // 3. Multiplex video and audio into final MP4 using MediaMuxer with interleaved samples
         appStorage.saveDownload(item.copy(progress = 96, status = DownloadStatus.DOWNLOADING))
-        muxStreams(videoPart, audioPart, finalFile)
+        try {
+            muxStreams(videoPart, audioPart, finalFile)
+        } catch (e: Exception) {
+            Log.w("DownloadManager", "Muxing streams failed, falling back to video stream directly", e)
+            if (videoPart.exists() && (!finalFile.exists() || finalFile.length() == 0L)) {
+                videoPart.copyTo(finalFile, overwrite = true)
+            }
+        }
 
         // Cleanup part files
         videoPart.delete()
@@ -404,6 +411,8 @@ class DownloadManager private constructor(private val context: Context) {
 
             var videoDone = (videoSourceTrack < 0)
             var audioDone = (audioSourceTrack < 0 || audioExtractor == null)
+            var lastVideoPts = -1L
+            var lastAudioPts = -1L
 
             while (!videoDone || !audioDone) {
                 val videoTime = if (!videoDone) videoExtractor.sampleTime else Long.MAX_VALUE
@@ -415,7 +424,10 @@ class DownloadManager private constructor(private val context: Context) {
                     if (videoBufferInfo.size < 0) {
                         videoDone = true
                     } else {
-                        videoBufferInfo.presentationTimeUs = videoExtractor.sampleTime
+                        var pts = videoExtractor.sampleTime
+                        if (pts <= lastVideoPts) pts = lastVideoPts + 1000L
+                        lastVideoPts = pts
+                        videoBufferInfo.presentationTimeUs = pts
                         videoBufferInfo.flags = videoExtractor.sampleFlags
                         muxer.writeSampleData(videoTrackIndex, videoBuf, videoBufferInfo)
                         videoExtractor.advance()
@@ -426,7 +438,10 @@ class DownloadManager private constructor(private val context: Context) {
                     if (audioBufferInfo.size < 0) {
                         audioDone = true
                     } else {
-                        audioBufferInfo.presentationTimeUs = audioExtractor.sampleTime
+                        var pts = audioExtractor.sampleTime
+                        if (pts <= lastAudioPts) pts = lastAudioPts + 1000L
+                        lastAudioPts = pts
+                        audioBufferInfo.presentationTimeUs = pts
                         audioBufferInfo.flags = audioExtractor.sampleFlags
                         muxer.writeSampleData(audioTrackIndex, audioBuf, audioBufferInfo)
                         audioExtractor.advance()

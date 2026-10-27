@@ -1,9 +1,11 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/download_record.dart';
 class DownloadLibraryService {
   static const _prefsKey = 'download_library_v1';
   static final DownloadLibraryService instance = DownloadLibraryService._();
+  final ValueNotifier<int> updates = ValueNotifier<int>(0);
   DownloadLibraryService._();
   Future<List<DownloadRecord>> loadAll() async {
     final prefs = await SharedPreferences.getInstance();
@@ -26,6 +28,7 @@ class DownloadLibraryService {
       _prefsKey,
       jsonEncode(records.map((e) => e.toJson()).toList()),
     );
+    updates.value++;
   }
   Future<void> add(DownloadRecord record) async {
     final records = await loadAll();
@@ -41,5 +44,6 @@ class DownloadLibraryService {
   Future<void> clear() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(_prefsKey);
+    updates.value++;
   }
 }
