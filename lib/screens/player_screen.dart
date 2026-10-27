@@ -745,6 +745,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     }
   }
   Future<void> _startDownloadFlow() async {
+    if (_downloading) return;
     List<DashRepresentation> reps = List.from(_representations);
     final mpd = _currentMpdContent ?? widget.mpdContent;
     if (reps.isEmpty && mpd != null && mpd.isNotEmpty) {
@@ -782,10 +783,13 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
   Future<void> _runDownload(String title, {DashRepresentation? selectedRep}) async {
-    if (!mounted) return;
-    await NotificationService.requestPermission();
-    if (!mounted) return;
+    if (!mounted || _downloading) return;
     setState(() => _downloading = true);
+    await NotificationService.requestPermission();
+    if (!mounted) {
+      _downloading = false;
+      return;
+    }
     final l10n = AppLocalizations.of(context);
     final qualityText = selectedRep?.qualityLabel.isNotEmpty == true
         ? ' (${selectedRep!.qualityLabel})'

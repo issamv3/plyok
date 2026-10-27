@@ -108,15 +108,44 @@ class DashParser {
     }
   }
   static String _resolveContentType(XmlElement el) {
-    final direct = el.getAttribute('contentType');
-    if (direct != null && direct.isNotEmpty) return direct;
-    final mimeType = el.getAttribute('mimeType') ?? '';
+    final direct = el.getAttribute('contentType')?.toLowerCase();
+    if (direct == 'video' || direct == 'audio') return direct!;
+    final mimeType = el.getAttribute('mimeType')?.toLowerCase() ?? '';
     if (mimeType.startsWith('video')) return 'video';
     if (mimeType.startsWith('audio')) return 'audio';
+    if (el.findElements('AudioChannelConfiguration').isNotEmpty) return 'audio';
     for (final rep in el.findElements('Representation')) {
-      final mime = rep.getAttribute('mimeType') ?? '';
+      final repDirect = rep.getAttribute('contentType')?.toLowerCase();
+      if (repDirect == 'video' || repDirect == 'audio') return repDirect!;
+      final mime = rep.getAttribute('mimeType')?.toLowerCase() ?? '';
       if (mime.startsWith('video')) return 'video';
       if (mime.startsWith('audio')) return 'audio';
+      final codecs = rep.getAttribute('codecs')?.toLowerCase() ?? '';
+      if (codecs.startsWith('avc') ||
+          codecs.startsWith('hev') ||
+          codecs.startsWith('hvc') ||
+          codecs.startsWith('vp') ||
+          codecs.startsWith('mp4v')) {
+        return 'video';
+      }
+      if (codecs.startsWith('mp4a') ||
+          codecs.startsWith('aac') ||
+          codecs.startsWith('opus') ||
+          codecs.startsWith('vorbis') ||
+          codecs.startsWith('ac-3') ||
+          codecs.startsWith('ec-3') ||
+          codecs.startsWith('flac')) {
+        return 'audio';
+      }
+      final enc = rep.getAttribute('FBEncodingTag')?.toLowerCase() ?? '';
+      if (enc.contains('video') || enc.contains('h264') || enc.contains('h265')) return 'video';
+      if (enc.contains('audio') || enc.contains('aac')) return 'audio';
+      if (rep.getAttribute('audioSamplingRate') != null) return 'audio';
+      if (rep.findElements('AudioChannelConfiguration').isNotEmpty) return 'audio';
+      if ((rep.getAttribute('width') != null && rep.getAttribute('width') != '0') ||
+          (rep.getAttribute('height') != null && rep.getAttribute('height') != '0')) {
+        return 'video';
+      }
     }
     return '';
   }

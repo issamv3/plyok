@@ -361,6 +361,45 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun safeAddTrack(muxer: MediaMuxer, fmt: MediaFormat, isAudio: Boolean): Int {
+        try {
+            return muxer.addTrack(fmt)
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "Direct muxer.addTrack failed, creating clean format: ${e.message}")
+            val mime = fmt.getString(MediaFormat.KEY_MIME) ?: if (isAudio) "audio/mp4a-latm" else "video/avc"
+            val cleanFmt = if (isAudio) {
+                val sampleRate = if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE) else 44100
+                val channelCount = if (fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT) else 2
+                MediaFormat.createAudioFormat(mime, sampleRate, channelCount)
+            } else {
+                val w = if (fmt.containsKey(MediaFormat.KEY_WIDTH)) fmt.getInteger(MediaFormat.KEY_WIDTH) else 1280
+                val h = if (fmt.containsKey(MediaFormat.KEY_HEIGHT)) fmt.getInteger(MediaFormat.KEY_HEIGHT) else 720
+                MediaFormat.createVideoFormat(mime, w, h)
+            }
+            if (fmt.containsKey("csd-0")) {
+                cleanFmt.setByteBuffer("csd-0", fmt.getByteBuffer("csd-0"))
+            }
+            if (fmt.containsKey("csd-1")) {
+                cleanFmt.setByteBuffer("csd-1", fmt.getByteBuffer("csd-1"))
+            }
+            if (!isAudio && fmt.containsKey(MediaFormat.KEY_ROTATION)) {
+                cleanFmt.setInteger(MediaFormat.KEY_ROTATION, fmt.getInteger(MediaFormat.KEY_ROTATION))
+            }
+            return muxer.addTrack(cleanFmt)
+        }
+    }
+
+    private fun setExtractorDataSource(extractor: MediaExtractor, file: File): java.io.FileInputStream? {
+        return try {
+            extractor.setDataSource(file.absolutePath)
+            null
+        } catch (_: Exception) {
+            val fis = java.io.FileInputStream(file)
+            extractor.setDataSource(fis.fd)
+            fis
+        }
+    }
+
     private fun handleMux(call: MethodCall, result: MethodChannel.Result) {
         val videoPath = call.argument<String>("videoPath")
         val audioPath = call.argument<String>("audioPath")
@@ -388,8 +427,7 @@ class MainActivity : FlutterActivity() {
 
                 muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-                vFis = java.io.FileInputStream(videoFile)
-                videoExtractor.setDataSource(vFis.fd)
+                vFis = setExtractorDataSource(videoExtractor, videoFile)
 
                 var videoTrackIn = -1
                 var videoTrackOut = -1
@@ -398,11 +436,11 @@ class MainActivity : FlutterActivity() {
                     val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
                     if (mime.startsWith("video/")) {
                         videoTrackIn = i
-                        videoTrackOut = muxer.addTrack(fmt)
+                        videoTrackOut = safeAddTrack(muxer, fmt, isAudio = false)
                         break
                     }
                 }
-                if (videoTrackIn < 0) {
+                if (videoTrackIn < 0 || videoTrackOut < 0) {
                     runOnUiThread { result.error("mux_failed", "no video track found", null) }
                     return@Thread
                 }
@@ -413,28 +451,33 @@ class MainActivity : FlutterActivity() {
                     val audioFile = File(audioPath)
                     if (audioFile.exists() && audioFile.length() > 0L) {
                         try {
-                            aFis = java.io.FileInputStream(audioFile)
-                            audioExtractor.setDataSource(aFis.fd)
+                            aFis = setExtractorDataSource(audioExtractor, audioFile)
                             for (i in 0 until audioExtractor.trackCount) {
                                 val fmt = audioExtractor.getTrackFormat(i)
                                 val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
                                 if (mime.startsWith("audio/")) {
                                     audioTrackIn = i
-                                    audioTrackOut = muxer.addTrack(fmt)
+                                    audioTrackOut = safeAddTrack(muxer, fmt, isAudio = true)
                                     break
                                 }
                             }
                         } catch (ae: Exception) {
-                            android.util.Log.w("MainActivity", "Audio track extraction failed", ae)
+                            android.util.Log.e("MainActivity", "Audio track extraction failed", ae)
+                            runOnUiThread { result.error("mux_failed", "Audio extraction failed: ${ae.message}", null) }
+                            return@Thread
                         }
+                    }
+                    if (audioTrackIn < 0 || audioTrackOut < 0) {
+                        android.util.Log.e("MainActivity", "Audio track could not be added")
+                        runOnUiThread { result.error("mux_failed", "Audio track could not be extracted from audio file", null) }
+                        return@Thread
                     }
                 }
 
                 muxer.start()
 
-                val bufSize = 2 * 1024 * 1024
-                val videoBuf = ByteBuffer.allocateDirect(bufSize)
-                val audioBuf = ByteBuffer.allocateDirect(bufSize)
+                val videoBuf = ByteBuffer.allocateDirect(4 * 1024 * 1024)
+                val audioBuf = ByteBuffer.allocateDirect(1 * 1024 * 1024)
                 val videoInfo = MediaCodec.BufferInfo()
                 val audioInfo = MediaCodec.BufferInfo()
 
@@ -444,8 +487,20 @@ class MainActivity : FlutterActivity() {
                 if (audioTrackIn >= 0 && audioTrackOut >= 0 && audioExtractor != null) {
                     videoExtractor.selectTrack(videoTrackIn)
                     audioExtractor.selectTrack(audioTrackIn)
+
+                    val firstVideoTime = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else -1L
+                    val firstAudioTime = if (audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else -1L
+                    val basePts = if (firstVideoTime >= 0L && firstAudioTime >= 0L) {
+                        minOf(firstVideoTime, firstAudioTime)
+                    } else if (firstVideoTime >= 0L) {
+                        firstVideoTime
+                    } else if (firstAudioTime >= 0L) {
+                        firstAudioTime
+                    } else 0L
+
                     var videoDone = false
                     var audioDone = false
+
                     while (!videoDone || !audioDone) {
                         val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
                             videoExtractor.sampleTime
@@ -455,7 +510,11 @@ class MainActivity : FlutterActivity() {
                             audioExtractor.sampleTime
                         } else Long.MAX_VALUE
 
-                        if (!videoDone && (audioDone || (videoTime != Long.MAX_VALUE && (audioTime == Long.MAX_VALUE || videoTime <= audioTime)))) {
+                        if (videoTime == Long.MAX_VALUE && audioTime == Long.MAX_VALUE) {
+                            break
+                        }
+
+                        if (!videoDone && (audioDone || videoTime <= audioTime)) {
                             videoBuf.clear()
                             val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
                             if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
@@ -467,10 +526,10 @@ class MainActivity : FlutterActivity() {
                                 videoInfo.offset = 0
                                 videoInfo.size = sampleSize
 
-                                var pts = videoExtractor.sampleTime
+                                var pts = videoExtractor.sampleTime - basePts
                                 if (pts < 0L) pts = 0L
-                                if (pts <= lastVideoPts) {
-                                    pts = lastVideoPts + 1000L
+                                if (pts < lastVideoPts) {
+                                    pts = lastVideoPts
                                 }
                                 lastVideoPts = pts
                                 videoInfo.presentationTimeUs = pts
@@ -495,10 +554,10 @@ class MainActivity : FlutterActivity() {
                                 audioInfo.offset = 0
                                 audioInfo.size = sampleSize
 
-                                var pts = audioExtractor.sampleTime
+                                var pts = audioExtractor.sampleTime - basePts
                                 if (pts < 0L) pts = 0L
-                                if (pts <= lastAudioPts) {
-                                    pts = lastAudioPts + 1000L
+                                if (pts < lastAudioPts) {
+                                    pts = lastAudioPts
                                 }
                                 lastAudioPts = pts
                                 audioInfo.presentationTimeUs = pts
@@ -515,6 +574,8 @@ class MainActivity : FlutterActivity() {
                     }
                 } else {
                     videoExtractor.selectTrack(videoTrackIn)
+                    val basePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
+
                     while (true) {
                         videoBuf.clear()
                         val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
@@ -526,10 +587,10 @@ class MainActivity : FlutterActivity() {
                         videoInfo.offset = 0
                         videoInfo.size = sampleSize
 
-                        var pts = videoExtractor.sampleTime
+                        var pts = videoExtractor.sampleTime - basePts
                         if (pts < 0L) pts = 0L
-                        if (pts <= lastVideoPts) {
-                            pts = lastVideoPts + 1000L
+                        if (pts < lastVideoPts) {
+                            pts = lastVideoPts
                         }
                         lastVideoPts = pts
                         videoInfo.presentationTimeUs = pts
@@ -544,7 +605,9 @@ class MainActivity : FlutterActivity() {
                     }
                 }
 
-                try { muxer.stop() } catch (_: Exception) {}
+                try { muxer.stop() } catch (se: Exception) {
+                    android.util.Log.w("MainActivity", "muxer.stop failed", se)
+                }
 
                 if (outFile.exists() && outFile.length() > 0L) {
                     runOnUiThread { result.success(true) }
@@ -552,13 +615,10 @@ class MainActivity : FlutterActivity() {
                     runOnUiThread { result.error("mux_failed", "output file empty", null) }
                 }
             } catch (e: Exception) {
+                android.util.Log.e("MainActivity", "handleMux error", e)
                 val outFile = File(outputPath)
-                if (outFile.exists() && outFile.length() > 0L) {
-                    runOnUiThread { result.success(true) }
-                } else {
-                    try { outFile.delete() } catch (_: Exception) {}
-                    runOnUiThread { result.error("mux_failed", e.message, null) }
-                }
+                try { outFile.delete() } catch (_: Exception) {}
+                runOnUiThread { result.error("mux_failed", e.message, null) }
             } finally {
                 try { muxer?.release() } catch (_: Exception) {}
                 try { videoExtractor.release() } catch (_: Exception) {}
@@ -587,13 +647,23 @@ class MainActivity : FlutterActivity() {
             val retriever = MediaMetadataRetriever()
             var fis: java.io.FileInputStream? = null
             try {
-                fis = java.io.FileInputStream(videoFile)
-                retriever.setDataSource(fis.fd)
+                try {
+                    retriever.setDataSource(videoFile.absolutePath)
+                } catch (_: Exception) {
+                    fis = java.io.FileInputStream(videoFile)
+                    retriever.setDataSource(fis.fd)
+                }
 
                 var frame: Bitmap? = null
                 try {
                     frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
                 } catch (_: Exception) {}
+
+                if (frame == null) {
+                    try {
+                        frame = retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } catch (_: Exception) {}
+                }
 
                 if (frame == null) {
                     try {

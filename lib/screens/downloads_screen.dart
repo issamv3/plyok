@@ -37,7 +37,6 @@ class _DownloadsScreenState extends State<DownloadsScreen> {
   void _onActivesChanged() {
     if (mounted) {
       setState(() {});
-      _load();
     }
   }
   Future<void> _load() async {

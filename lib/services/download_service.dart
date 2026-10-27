@@ -275,6 +275,25 @@ class DownloadService {
     String? originalFbUrl,
     String? fbVideoId,
   }) async {
+    // Prevent duplicate tasks for the same video
+    final isAlreadyActive = _allParams.values.any((p) {
+      if (originalFbUrl != null &&
+          originalFbUrl.isNotEmpty &&
+          p.originalFbUrl == originalFbUrl) {
+        return true;
+      }
+      if (fbVideoId != null &&
+          fbVideoId.isNotEmpty &&
+          p.fbVideoId == fbVideoId) {
+        return true;
+      }
+      if (p.videoPath == videoPath && p.title == title) return true;
+      return false;
+    });
+    if (isAlreadyActive) {
+      return;
+    }
+
     final id =
         'dl_${DateTime.now().millisecondsSinceEpoch}_${title.hashCode.abs()}_${_allParams.length}';
     final params = _DownloadParams(
@@ -422,7 +441,7 @@ class DownloadService {
         }
         resolvedVideoUrl = maybeVideoUrl;
         final audioRep = DashParser.bestAudio(rewrittenMpd);
-        if (audioRep != null && audioRep.baseUrl != resolvedVideoUrl) {
+        if (audioRep != null) {
           audioUrl = audioRep.baseUrl;
         }
       } else {
@@ -548,10 +567,9 @@ class DownloadService {
           muxError = e.toString();
         }
         if (!muxed) {
-          // Fallback: If muxing fails, copy video directly so user never loses downloaded video
+          // If muxing fails with audio, delete partial file and report error so user isn't stuck with silent video
           try {
-            await File(stagedVideoPath).copy(outputPath);
-            muxed = true;
+            if (await outFile.exists()) await outFile.delete();
           } catch (_) {}
         }
       }
@@ -560,7 +578,7 @@ class DownloadService {
         updateTask(DownloadTask(
             id: id, title: title, progress: 98, status: 'Saving…'));
         await NotificationService.showProgress(
-            title: title, body: 'Saving to gallery…', progress: 98);
+            title: title, body: 'Saving…', progress: 98);
         await _persistToLibrary(
           id: id,
           title: title,
@@ -675,7 +693,13 @@ class DownloadService {
         } catch (_) {}
       }
       final existing = await DownloadLibraryService.instance.loadAll();
-      final existingPaths = existing.map((e) => e.filePath).toSet();
+      final existingPaths = existing.map((e) => File(e.filePath).path).toSet();
+      final existingNames = existing.map((e) => e.filePath.split('/').last.toLowerCase()).toSet();
+      final activePaths = <String>{..._reservedOutputPaths};
+      for (final p in _allParams.values) {
+        if (p.resolvedOutputPath != null) activePaths.add(p.resolvedOutputPath!);
+      }
+
       for (final dir in dirsToScan) {
         if (!await dir.exists()) continue;
         final files = dir
@@ -683,14 +707,20 @@ class DownloadService {
             .whereType<File>()
             .where((f) {
               final p = f.path.toLowerCase();
-              return p.endsWith('.mp4') ||
-                  p.endsWith('.mkv') ||
-                  p.endsWith('.webm');
+              return (p.endsWith('.mp4') ||
+                      p.endsWith('.mkv') ||
+                      p.endsWith('.webm')) &&
+                  !p.contains('.incomplete') &&
+                  f.lengthSync() > 0;
             })
             .toList();
         for (final file in files) {
-          if (existingPaths.contains(file.path)) continue;
           final name = file.uri.pathSegments.last;
+          if (existingPaths.contains(file.path) ||
+              existingNames.contains(name.toLowerCase()) ||
+              activePaths.contains(file.path)) {
+            continue;
+          }
           final title =
               name.contains('.') ? name.substring(0, name.lastIndexOf('.')) : name;
           final id = 'scan_${file.path.hashCode.abs()}';
@@ -782,9 +812,6 @@ class DownloadService {
       isDash: isDash,
       downloadedAtMs: DateTime.now().millisecondsSinceEpoch,
     ));
-    try {
-      await Gal.putVideo(filePath);
-    } catch (_) {}
   }
 
   static Future<void> _downloadToFile(

@@ -16,7 +16,16 @@ class DownloadLibraryService {
           .map((e) => DownloadRecord.fromJson(e as Map<String, dynamic>))
           .toList();
       list.sort((a, b) => b.downloadedAtMs.compareTo(a.downloadedAtMs));
-      return list;
+      // Deduplicate by filePath keeping latest record
+      final seenPaths = <String>{};
+      final uniqueList = <DownloadRecord>[];
+      for (final r in list) {
+        if (!seenPaths.contains(r.filePath)) {
+          seenPaths.add(r.filePath);
+          uniqueList.add(r);
+        }
+      }
+      return uniqueList;
     } catch (_) {
       return [];
     }
@@ -24,15 +33,24 @@ class DownloadLibraryService {
   Future<void> _saveAll(List<DownloadRecord> records) async {
     final prefs = await SharedPreferences.getInstance();
     records.sort((a, b) => b.downloadedAtMs.compareTo(a.downloadedAtMs));
+    // Deduplicate before saving
+    final seenPaths = <String>{};
+    final uniqueList = <DownloadRecord>[];
+    for (final r in records) {
+      if (!seenPaths.contains(r.filePath)) {
+        seenPaths.add(r.filePath);
+        uniqueList.add(r);
+      }
+    }
     await prefs.setString(
       _prefsKey,
-      jsonEncode(records.map((e) => e.toJson()).toList()),
+      jsonEncode(uniqueList.map((e) => e.toJson()).toList()),
     );
     updates.value++;
   }
   Future<void> add(DownloadRecord record) async {
     final records = await loadAll();
-    records.removeWhere((e) => e.id == record.id);
+    records.removeWhere((e) => e.id == record.id || e.filePath == record.filePath);
     records.add(record);
     await _saveAll(records);
   }
