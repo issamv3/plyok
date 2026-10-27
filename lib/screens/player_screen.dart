@@ -101,6 +101,7 @@ class _PlayerScreenState extends State<PlayerScreen>
   bool _downloading = false;
   bool _showRemaining = false;
   final GlobalKey _videoBoundaryKey = GlobalKey();
+  final FileService _fs = FileService();
   bool _thumbnailCaptured = false;
   bool _volumeListenerReady = false;
   StreamSubscription<AccelerometerEvent>? _accelSub;
