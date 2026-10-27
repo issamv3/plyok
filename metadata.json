@@ -1,0 +1,6 @@
+{
+  "name": "Ply",
+  "description": "DASH and Facebook video player with download manager",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

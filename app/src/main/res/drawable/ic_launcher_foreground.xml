@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Stylish ply play triangle -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M44,36 L72,54 L44,72 Z" />
+    <path
+        android:fillColor="#818CF8"
+        android:pathData="M44,36 L58,45 L44,54 Z" />
+</vector>
