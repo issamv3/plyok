@@ -360,14 +360,17 @@ class DownloadManager private constructor(private val context: Context) {
      * Mux video and audio by interleaving sample buffers based on presentation timestamps
      */
     private fun muxStreams(videoFile: File, audioFile: File, outputFile: File) {
-        val videoExtractor = MediaExtractor().apply { setDataSource(videoFile.absolutePath) }
-        val audioExtractor = if (audioFile.exists() && audioFile.length() > 0) {
-            MediaExtractor().apply { setDataSource(audioFile.absolutePath) }
-        } else null
+        val videoExtractor = MediaExtractor()
+        val audioExtractor = if (audioFile.exists() && audioFile.length() > 0) MediaExtractor() else null
+        var vFis: java.io.FileInputStream? = null
+        var aFis: java.io.FileInputStream? = null
 
         val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
         try {
+            vFis = java.io.FileInputStream(videoFile)
+            videoExtractor.setDataSource(vFis.fd)
+
             var videoTrackIndex = -1
             var videoSourceTrack = -1
             for (i in 0 until videoExtractor.trackCount) {
@@ -383,6 +386,8 @@ class DownloadManager private constructor(private val context: Context) {
             var audioTrackIndex = -1
             var audioSourceTrack = -1
             if (audioExtractor != null) {
+                aFis = java.io.FileInputStream(audioFile)
+                audioExtractor.setDataSource(aFis.fd)
                 for (i in 0 until audioExtractor.trackCount) {
                     val format = audioExtractor.getTrackFormat(i)
                     val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
@@ -403,9 +408,9 @@ class DownloadManager private constructor(private val context: Context) {
                 audioExtractor.selectTrack(audioSourceTrack)
             }
 
-            val bufferSize = 1024 * 1024
-            val videoBuf = ByteBuffer.allocate(bufferSize)
-            val audioBuf = ByteBuffer.allocate(bufferSize)
+            val bufferSize = 2 * 1024 * 1024
+            val videoBuf = ByteBuffer.allocateDirect(bufferSize)
+            val audioBuf = ByteBuffer.allocateDirect(bufferSize)
             val videoBufferInfo = MediaCodec.BufferInfo()
             val audioBufferInfo = MediaCodec.BufferInfo()
 
@@ -415,34 +420,58 @@ class DownloadManager private constructor(private val context: Context) {
             var lastAudioPts = -1L
 
             while (!videoDone || !audioDone) {
-                val videoTime = if (!videoDone) videoExtractor.sampleTime else Long.MAX_VALUE
-                val audioTime = if (!audioDone && audioExtractor != null) audioExtractor.sampleTime else Long.MAX_VALUE
+                val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else Long.MAX_VALUE
+                val audioTime = if (!audioDone && audioExtractor != null && audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else Long.MAX_VALUE
 
-                if (!videoDone && (audioDone || videoTime <= audioTime)) {
-                    videoBufferInfo.offset = 0
-                    videoBufferInfo.size = videoExtractor.readSampleData(videoBuf, 0)
-                    if (videoBufferInfo.size < 0) {
+                if (!videoDone && (audioDone || (videoTime != Long.MAX_VALUE && (audioTime == Long.MAX_VALUE || videoTime <= audioTime)))) {
+                    videoBuf.clear()
+                    val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                    if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
                         videoDone = true
                     } else {
+                        videoBuf.position(0)
+                        videoBuf.limit(sampleSize)
+
+                        videoBufferInfo.offset = 0
+                        videoBufferInfo.size = sampleSize
+
                         var pts = videoExtractor.sampleTime
+                        if (pts < 0L) pts = 0L
                         if (pts <= lastVideoPts) pts = lastVideoPts + 1000L
                         lastVideoPts = pts
                         videoBufferInfo.presentationTimeUs = pts
-                        videoBufferInfo.flags = videoExtractor.sampleFlags
+
+                        val flags = videoExtractor.sampleFlags
+                        videoBufferInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                            MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        } else 0
+
                         muxer.writeSampleData(videoTrackIndex, videoBuf, videoBufferInfo)
                         videoExtractor.advance()
                     }
                 } else if (!audioDone && audioExtractor != null) {
-                    audioBufferInfo.offset = 0
-                    audioBufferInfo.size = audioExtractor.readSampleData(audioBuf, 0)
-                    if (audioBufferInfo.size < 0) {
+                    audioBuf.clear()
+                    val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
+                    if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
                         audioDone = true
                     } else {
+                        audioBuf.position(0)
+                        audioBuf.limit(sampleSize)
+
+                        audioBufferInfo.offset = 0
+                        audioBufferInfo.size = sampleSize
+
                         var pts = audioExtractor.sampleTime
+                        if (pts < 0L) pts = 0L
                         if (pts <= lastAudioPts) pts = lastAudioPts + 1000L
                         lastAudioPts = pts
                         audioBufferInfo.presentationTimeUs = pts
-                        audioBufferInfo.flags = audioExtractor.sampleFlags
+
+                        val flags = audioExtractor.sampleFlags
+                        audioBufferInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                            MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        } else 0
+
                         muxer.writeSampleData(audioTrackIndex, audioBuf, audioBufferInfo)
                         audioExtractor.advance()
                     }
@@ -453,6 +482,8 @@ class DownloadManager private constructor(private val context: Context) {
             try { muxer.release() } catch (_: Exception) {}
             try { videoExtractor.release() } catch (_: Exception) {}
             try { audioExtractor?.release() } catch (_: Exception) {}
+            try { vFis?.close() } catch (_: Exception) {}
+            try { aFis?.close() } catch (_: Exception) {}
         }
     }
 

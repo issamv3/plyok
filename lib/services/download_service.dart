@@ -389,25 +389,39 @@ class DownloadService {
           filePath: outputPath,
           isDash: p.isDash,
           durationMs: p.durationMs,
+          existingThumbnailPath: thumbnailPath,
         );
         await NotificationService.showComplete(title, filePath: outputPath);
         return;
       }
       String resolvedVideoUrl;
       String? audioUrl;
-      if (p.isDash && p.mpdContent != null) {
-        final effectiveMpd = await CdnService.raceAndRewriteMpd(
-          p.mpdContent!,
+      var effectiveMpd = p.mpdContent;
+      if (effectiveMpd == null || !effectiveMpd.contains('<MPD')) {
+        if (p.videoPath.contains('<MPD')) {
+          effectiveMpd = p.videoPath;
+        } else if (!p.videoPath.startsWith('http') && File(p.videoPath).existsSync()) {
+          try {
+            final text = await File(p.videoPath).readAsString();
+            if (text.contains('<MPD')) effectiveMpd = text;
+          } catch (_) {}
+        }
+      }
+
+      final isDash = p.isDash || (effectiveMpd != null && effectiveMpd.contains('<MPD'));
+      if (isDash && effectiveMpd != null) {
+        final rewrittenMpd = await CdnService.raceAndRewriteMpd(
+          effectiveMpd,
           fbCdnEnabled: p.fbCdnEnabled,
         );
-        final videoReps = DashParser.parse(effectiveMpd);
+        final videoReps = DashParser.parse(rewrittenMpd);
         final maybeVideoUrl = resolveVideoUrl(videoReps, p.selectedVideoRep);
         if (maybeVideoUrl == null) {
           await NotificationService.showError(title, 'No video track found');
           return;
         }
         resolvedVideoUrl = maybeVideoUrl;
-        final audioRep = DashParser.bestAudio(effectiveMpd);
+        final audioRep = DashParser.bestAudio(rewrittenMpd);
         if (audioRep != null && audioRep.baseUrl != resolvedVideoUrl) {
           audioUrl = audioRep.baseUrl;
         }
@@ -417,9 +431,9 @@ class DownloadService {
           fbCdnEnabled: p.fbCdnEnabled,
         );
       }
-      final stagedVideoPath = '${persistentTempDir.path}/${id}_video.tmp';
+      final stagedVideoPath = '${persistentTempDir.path}/${id}_video.mp4';
       final stagedAudioPath =
-          audioUrl != null ? '${persistentTempDir.path}/${id}_audio.tmp' : null;
+          audioUrl != null ? '${persistentTempDir.path}/${id}_audio.mp4' : null;
       await NotificationService.showProgress(
           title: title, body: 'Downloading… 0%', progress: 0);
       final videoWeight = audioUrl != null ? 0.7 : 1.0;
@@ -553,6 +567,7 @@ class DownloadService {
           filePath: outputPath,
           isDash: p.isDash,
           durationMs: p.durationMs,
+          existingThumbnailPath: thumbnailPath,
         );
         await NotificationService.showComplete(title, filePath: outputPath);
       } else {
@@ -719,6 +734,7 @@ class DownloadService {
     required String filePath,
     required bool isDash,
     int? durationMs,
+    String? existingThumbnailPath,
   }) async {
     var resolvedDuration = durationMs ?? 0;
     if (resolvedDuration <= 0) {
@@ -743,6 +759,20 @@ class DownloadService {
         thumbnailPath = candidatePath;
       }
     } catch (_) {}
+
+    if (thumbnailPath == null &&
+        existingThumbnailPath != null &&
+        File(existingThumbnailPath).existsSync()) {
+      try {
+        final thumbsDir = await _thumbnailsDirectory();
+        final candidatePath = '${thumbsDir.path}/$id.jpg';
+        await File(existingThumbnailPath).copy(candidatePath);
+        thumbnailPath = candidatePath;
+      } catch (_) {
+        thumbnailPath = existingThumbnailPath;
+      }
+    }
+
     await DownloadLibraryService.instance.add(DownloadRecord(
       id: id,
       title: title,

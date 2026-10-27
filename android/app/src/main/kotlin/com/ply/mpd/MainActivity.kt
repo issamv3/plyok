@@ -373,14 +373,24 @@ class MainActivity : FlutterActivity() {
             var muxer: MediaMuxer? = null
             val videoExtractor = MediaExtractor()
             val audioExtractor = if (audioPath != null) MediaExtractor() else null
+            var vFis: java.io.FileInputStream? = null
+            var aFis: java.io.FileInputStream? = null
             try {
+                val videoFile = File(videoPath)
+                if (!videoFile.exists() || videoFile.length() == 0L) {
+                    runOnUiThread { result.error("mux_failed", "video file missing or empty", null) }
+                    return@Thread
+                }
+
                 val outFile = File(outputPath)
                 outFile.parentFile?.mkdirs()
                 if (outFile.exists()) outFile.delete()
 
                 muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-                videoExtractor.setDataSource(videoPath)
+                vFis = java.io.FileInputStream(videoFile)
+                videoExtractor.setDataSource(vFis.fd)
+
                 var videoTrackIn = -1
                 var videoTrackOut = -1
                 for (i in 0 until videoExtractor.trackCount) {
@@ -400,14 +410,22 @@ class MainActivity : FlutterActivity() {
                 var audioTrackIn = -1
                 var audioTrackOut = -1
                 if (audioPath != null && audioExtractor != null) {
-                    audioExtractor.setDataSource(audioPath)
-                    for (i in 0 until audioExtractor.trackCount) {
-                        val fmt = audioExtractor.getTrackFormat(i)
-                        val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                        if (mime.startsWith("audio/")) {
-                            audioTrackIn = i
-                            audioTrackOut = muxer.addTrack(fmt)
-                            break
+                    val audioFile = File(audioPath)
+                    if (audioFile.exists() && audioFile.length() > 0L) {
+                        try {
+                            aFis = java.io.FileInputStream(audioFile)
+                            audioExtractor.setDataSource(aFis.fd)
+                            for (i in 0 until audioExtractor.trackCount) {
+                                val fmt = audioExtractor.getTrackFormat(i)
+                                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                                if (mime.startsWith("audio/")) {
+                                    audioTrackIn = i
+                                    audioTrackOut = muxer.addTrack(fmt)
+                                    break
+                                }
+                            }
+                        } catch (ae: Exception) {
+                            android.util.Log.w("MainActivity", "Audio track extraction failed", ae)
                         }
                     }
                 }
@@ -415,8 +433,11 @@ class MainActivity : FlutterActivity() {
                 muxer.start()
 
                 val bufSize = 2 * 1024 * 1024
-                val buf = ByteBuffer.allocate(bufSize)
-                val info = MediaCodec.BufferInfo()
+                val videoBuf = ByteBuffer.allocateDirect(bufSize)
+                val audioBuf = ByteBuffer.allocateDirect(bufSize)
+                val videoInfo = MediaCodec.BufferInfo()
+                val audioInfo = MediaCodec.BufferInfo()
+
                 var lastVideoPts = -1L
                 var lastAudioPts = -1L
 
@@ -426,39 +447,68 @@ class MainActivity : FlutterActivity() {
                     var videoDone = false
                     var audioDone = false
                     while (!videoDone || !audioDone) {
-                        val videoTime = if (!videoDone) videoExtractor.sampleTime else Long.MAX_VALUE
-                        val audioTime = if (!audioDone) audioExtractor.sampleTime else Long.MAX_VALUE
+                        val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
+                            videoExtractor.sampleTime
+                        } else Long.MAX_VALUE
 
-                        if (!videoDone && (audioDone || videoTime <= audioTime)) {
-                            info.offset = 0
-                            info.size = videoExtractor.readSampleData(buf, 0)
-                            if (info.size < 0) {
+                        val audioTime = if (!audioDone && audioExtractor.sampleTrackIndex >= 0) {
+                            audioExtractor.sampleTime
+                        } else Long.MAX_VALUE
+
+                        if (!videoDone && (audioDone || (videoTime != Long.MAX_VALUE && (audioTime == Long.MAX_VALUE || videoTime <= audioTime)))) {
+                            videoBuf.clear()
+                            val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                            if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
                                 videoDone = true
                             } else {
+                                videoBuf.position(0)
+                                videoBuf.limit(sampleSize)
+
+                                videoInfo.offset = 0
+                                videoInfo.size = sampleSize
+
                                 var pts = videoExtractor.sampleTime
+                                if (pts < 0L) pts = 0L
                                 if (pts <= lastVideoPts) {
                                     pts = lastVideoPts + 1000L
                                 }
                                 lastVideoPts = pts
-                                info.presentationTimeUs = pts
-                                info.flags = videoExtractor.sampleFlags
-                                muxer.writeSampleData(videoTrackOut, buf, info)
+                                videoInfo.presentationTimeUs = pts
+
+                                val flags = videoExtractor.sampleFlags
+                                videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                } else 0
+
+                                muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
                                 videoExtractor.advance()
                             }
                         } else if (!audioDone) {
-                            info.offset = 0
-                            info.size = audioExtractor.readSampleData(buf, 0)
-                            if (info.size < 0) {
+                            audioBuf.clear()
+                            val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
+                            if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
                                 audioDone = true
                             } else {
+                                audioBuf.position(0)
+                                audioBuf.limit(sampleSize)
+
+                                audioInfo.offset = 0
+                                audioInfo.size = sampleSize
+
                                 var pts = audioExtractor.sampleTime
+                                if (pts < 0L) pts = 0L
                                 if (pts <= lastAudioPts) {
                                     pts = lastAudioPts + 1000L
                                 }
                                 lastAudioPts = pts
-                                info.presentationTimeUs = pts
-                                info.flags = audioExtractor.sampleFlags
-                                muxer.writeSampleData(audioTrackOut, buf, info)
+                                audioInfo.presentationTimeUs = pts
+
+                                val flags = audioExtractor.sampleFlags
+                                audioInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                    MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                } else 0
+
+                                muxer.writeSampleData(audioTrackOut, audioBuf, audioInfo)
                                 audioExtractor.advance()
                             }
                         }
@@ -466,30 +516,55 @@ class MainActivity : FlutterActivity() {
                 } else {
                     videoExtractor.selectTrack(videoTrackIn)
                     while (true) {
-                        info.offset = 0
-                        info.size = videoExtractor.readSampleData(buf, 0)
-                        if (info.size < 0) break
+                        videoBuf.clear()
+                        val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                        if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) break
+
+                        videoBuf.position(0)
+                        videoBuf.limit(sampleSize)
+
+                        videoInfo.offset = 0
+                        videoInfo.size = sampleSize
+
                         var pts = videoExtractor.sampleTime
+                        if (pts < 0L) pts = 0L
                         if (pts <= lastVideoPts) {
                             pts = lastVideoPts + 1000L
                         }
                         lastVideoPts = pts
-                        info.presentationTimeUs = pts
-                        info.flags = videoExtractor.sampleFlags
-                        muxer.writeSampleData(videoTrackOut, buf, info)
+                        videoInfo.presentationTimeUs = pts
+
+                        val flags = videoExtractor.sampleFlags
+                        videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                            MediaCodec.BUFFER_FLAG_KEY_FRAME
+                        } else 0
+
+                        muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
                         videoExtractor.advance()
                     }
                 }
 
-                muxer.stop()
-                runOnUiThread { result.success(true) }
+                try { muxer.stop() } catch (_: Exception) {}
+
+                if (outFile.exists() && outFile.length() > 0L) {
+                    runOnUiThread { result.success(true) }
+                } else {
+                    runOnUiThread { result.error("mux_failed", "output file empty", null) }
+                }
             } catch (e: Exception) {
-                try { File(outputPath).delete() } catch (_: Exception) {}
-                runOnUiThread { result.error("mux_failed", e.message, null) }
+                val outFile = File(outputPath)
+                if (outFile.exists() && outFile.length() > 0L) {
+                    runOnUiThread { result.success(true) }
+                } else {
+                    try { outFile.delete() } catch (_: Exception) {}
+                    runOnUiThread { result.error("mux_failed", e.message, null) }
+                }
             } finally {
                 try { muxer?.release() } catch (_: Exception) {}
                 try { videoExtractor.release() } catch (_: Exception) {}
                 try { audioExtractor?.release() } catch (_: Exception) {}
+                try { vFis?.close() } catch (_: Exception) {}
+                try { aFis?.close() } catch (_: Exception) {}
             }
         }.start()
     }
@@ -502,32 +577,67 @@ class MainActivity : FlutterActivity() {
             result.error("bad_args", "videoPath/outputPath required", null)
             return
         }
-        val retriever = MediaMetadataRetriever()
-        try {
-            retriever.setDataSource(videoPath)
-            val frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
-            if (frame == null) {
-                result.error("thumbnail_failed", "no frame extracted", null)
-                return
-            }
-            val targetWidth = 400
-            val scale = targetWidth.toFloat() / frame.width.toFloat()
-            val targetHeight = (frame.height * scale).toInt().coerceAtLeast(1)
-            val scaled = Bitmap.createScaledBitmap(frame, targetWidth, targetHeight, true)
-
-            val outFile = File(outputPath)
-            outFile.parentFile?.mkdirs()
-            FileOutputStream(outFile).use { fos ->
-                scaled.compress(Bitmap.CompressFormat.JPEG, 85, fos)
-            }
-
-            if (scaled !== frame) frame.recycle()
-            scaled.recycle()
-            result.success(true)
-        } catch (e: Exception) {
-            result.error("thumbnail_failed", e.message, null)
-        } finally {
-            retriever.release()
+        val videoFile = File(videoPath)
+        if (!videoFile.exists() || videoFile.length() == 0L) {
+            result.error("file_missing", "video file missing or empty", null)
+            return
         }
+
+        Thread {
+            val retriever = MediaMetadataRetriever()
+            var fis: java.io.FileInputStream? = null
+            try {
+                fis = java.io.FileInputStream(videoFile)
+                retriever.setDataSource(fis.fd)
+
+                var frame: Bitmap? = null
+                try {
+                    frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                } catch (_: Exception) {}
+
+                if (frame == null) {
+                    try {
+                        frame = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    } catch (_: Exception) {}
+                }
+
+                if (frame == null) {
+                    try {
+                        frame = retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    } catch (_: Exception) {}
+                }
+
+                if (frame == null) {
+                    try {
+                        frame = retriever.frameAtTime
+                    } catch (_: Exception) {}
+                }
+
+                if (frame == null) {
+                    runOnUiThread { result.error("thumbnail_failed", "no frame extracted", null) }
+                    return@Thread
+                }
+
+                val targetWidth = 480
+                val scale = targetWidth.toFloat() / frame.width.toFloat()
+                val targetHeight = (frame.height * scale).toInt().coerceAtLeast(1)
+                val scaled = Bitmap.createScaledBitmap(frame, targetWidth, targetHeight, true)
+
+                val outFile = File(outputPath)
+                outFile.parentFile?.mkdirs()
+                FileOutputStream(outFile).use { fos ->
+                    scaled.compress(Bitmap.CompressFormat.JPEG, 85, fos)
+                }
+
+                if (scaled !== frame) frame.recycle()
+                scaled.recycle()
+                runOnUiThread { result.success(true) }
+            } catch (e: Exception) {
+                runOnUiThread { result.error("thumbnail_failed", e.message, null) }
+            } finally {
+                try { retriever.release() } catch (_: Exception) {}
+                try { fis?.close() } catch (_: Exception) {}
+            }
+        }.start()
     }
 }
