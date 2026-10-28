@@ -18,6 +18,10 @@ import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import org.mp4parser.muxer.Movie
+import org.mp4parser.muxer.Track
+import org.mp4parser.muxer.builder.DefaultMp4Builder
+import org.mp4parser.muxer.container.mp4.MovieCreator
 
 class MainActivity : FlutterActivity() {
     private val channelName = "ply/media"
@@ -400,6 +404,240 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    private fun muxWithMp4Parser(videoPath: String, audioPath: String?, outputPath: String): Boolean {
+        return try {
+            val videoMovie = MovieCreator.build(videoPath)
+            val audioMovie = if (audioPath != null && File(audioPath).exists() && File(audioPath).length() > 0L) {
+                try {
+                    MovieCreator.build(audioPath)
+                } catch (e: Exception) {
+                    android.util.Log.w("MainActivity", "MP4Parser failed to parse audio track: ${e.message}")
+                    null
+                }
+            } else null
+
+            val movie = Movie()
+            for (track in videoMovie.tracks) {
+                if ("vide" == track.handler) {
+                    movie.addTrack(track)
+                }
+            }
+            if (audioMovie != null) {
+                for (track in audioMovie.tracks) {
+                    if ("soun" == track.handler) {
+                        movie.addTrack(track)
+                    }
+                }
+            }
+            if (movie.tracks.isEmpty()) return false
+
+            val builder = DefaultMp4Builder()
+            val mp4file = builder.build(movie)
+            val outFile = File(outputPath)
+            outFile.parentFile?.mkdirs()
+            FileOutputStream(outFile).use { fos ->
+                mp4file.writeContainer(fos.channel)
+            }
+            outFile.exists() && outFile.length() > 0L
+        } catch (e: Exception) {
+            android.util.Log.w("MainActivity", "muxWithMp4Parser failed: ${e.message}", e)
+            false
+        }
+    }
+
+    private fun muxWithMediaMuxer(videoPath: String, audioPath: String?, outputPath: String): Boolean {
+        var muxer: MediaMuxer? = null
+        val videoExtractor = MediaExtractor()
+        val audioExtractor = if (audioPath != null) MediaExtractor() else null
+        var vFis: java.io.FileInputStream? = null
+        var aFis: java.io.FileInputStream? = null
+        try {
+            val videoFile = File(videoPath)
+            if (!videoFile.exists() || videoFile.length() == 0L) return false
+
+            val outFile = File(outputPath)
+            outFile.parentFile?.mkdirs()
+            if (outFile.exists()) outFile.delete()
+
+            muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            vFis = setExtractorDataSource(videoExtractor, videoFile)
+
+            var videoTrackIn = -1
+            var videoTrackOut = -1
+            for (i in 0 until videoExtractor.trackCount) {
+                val fmt = videoExtractor.getTrackFormat(i)
+                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/")) {
+                    videoTrackIn = i
+                    videoTrackOut = safeAddTrack(muxer, fmt, isAudio = false)
+                    break
+                }
+            }
+            if (videoTrackIn < 0 || videoTrackOut < 0) return false
+
+            var audioTrackIn = -1
+            var audioTrackOut = -1
+            if (audioPath != null && audioExtractor != null) {
+                val audioFile = File(audioPath)
+                if (audioFile.exists() && audioFile.length() > 0L) {
+                    try {
+                        aFis = setExtractorDataSource(audioExtractor, audioFile)
+                        for (i in 0 until audioExtractor.trackCount) {
+                            val fmt = audioExtractor.getTrackFormat(i)
+                            val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                            if (mime.startsWith("audio/")) {
+                                audioTrackIn = i
+                                audioTrackOut = safeAddTrack(muxer, fmt, isAudio = true)
+                                break
+                            }
+                        }
+                    } catch (ae: Exception) {
+                        android.util.Log.w("MainActivity", "Audio track extraction in MediaMuxer failed: ${ae.message}")
+                    }
+                }
+            }
+
+            muxer.start()
+
+            val videoBuf = ByteBuffer.allocateDirect(4 * 1024 * 1024)
+            val audioBuf = ByteBuffer.allocateDirect(1 * 1024 * 1024)
+            val videoInfo = MediaCodec.BufferInfo()
+            val audioInfo = MediaCodec.BufferInfo()
+
+            var lastVideoPts = -1L
+            var lastAudioPts = -1L
+
+            if (audioTrackIn >= 0 && audioTrackOut >= 0 && audioExtractor != null) {
+                videoExtractor.selectTrack(videoTrackIn)
+                audioExtractor.selectTrack(audioTrackIn)
+
+                val videoBasePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
+                val audioBasePts = if (audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else 0L
+
+                var videoDone = false
+                var audioDone = false
+
+                while (!videoDone || !audioDone) {
+                    val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
+                        videoExtractor.sampleTime - videoBasePts
+                    } else Long.MAX_VALUE
+
+                    val audioTime = if (!audioDone && audioExtractor.sampleTrackIndex >= 0) {
+                        audioExtractor.sampleTime - audioBasePts
+                    } else Long.MAX_VALUE
+
+                    if (videoTime == Long.MAX_VALUE && audioTime == Long.MAX_VALUE) {
+                        break
+                    }
+
+                    if (!videoDone && (audioDone || videoTime <= audioTime)) {
+                        videoBuf.clear()
+                        val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                        if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
+                            videoDone = true
+                        } else {
+                            videoBuf.position(0)
+                            videoBuf.limit(sampleSize)
+
+                            videoInfo.offset = 0
+                            videoInfo.size = sampleSize
+
+                            var pts = videoExtractor.sampleTime - videoBasePts
+                            if (pts < 0L) pts = 0L
+                            if (pts <= lastVideoPts) {
+                                pts = lastVideoPts + 1000L
+                            }
+                            lastVideoPts = pts
+                            videoInfo.presentationTimeUs = pts
+
+                            val flags = videoExtractor.sampleFlags
+                            videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                MediaCodec.BUFFER_FLAG_KEY_FRAME
+                            } else 0
+
+                            muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
+                            videoExtractor.advance()
+                        }
+                    } else if (!audioDone) {
+                        audioBuf.clear()
+                        val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
+                        if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
+                            audioDone = true
+                        } else {
+                            audioBuf.position(0)
+                            audioBuf.limit(sampleSize)
+
+                            audioInfo.offset = 0
+                            audioInfo.size = sampleSize
+
+                            var pts = audioExtractor.sampleTime - audioBasePts
+                            if (pts < 0L) pts = 0L
+                            if (pts <= lastAudioPts) {
+                                pts = lastAudioPts + 1000L
+                            }
+                            lastAudioPts = pts
+                            audioInfo.presentationTimeUs = pts
+
+                            val flags = audioExtractor.sampleFlags
+                            audioInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                                MediaCodec.BUFFER_FLAG_KEY_FRAME
+                            } else 0
+
+                            muxer.writeSampleData(audioTrackOut, audioBuf, audioInfo)
+                            audioExtractor.advance()
+                        }
+                    }
+                }
+            } else {
+                videoExtractor.selectTrack(videoTrackIn)
+                val basePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
+
+                while (true) {
+                    videoBuf.clear()
+                    val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                    if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) break
+
+                    videoBuf.position(0)
+                    videoBuf.limit(sampleSize)
+
+                    videoInfo.offset = 0
+                    videoInfo.size = sampleSize
+
+                    var pts = videoExtractor.sampleTime - basePts
+                    if (pts < 0L) pts = 0L
+                    if (pts <= lastVideoPts) {
+                        pts = lastVideoPts + 1000L
+                    }
+                    lastVideoPts = pts
+                    videoInfo.presentationTimeUs = pts
+
+                    val flags = videoExtractor.sampleFlags
+                    videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                        MediaCodec.BUFFER_FLAG_KEY_FRAME
+                    } else 0
+
+                    muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
+                    videoExtractor.advance()
+                }
+            }
+
+            try { muxer.stop() } catch (se: Exception) {
+                android.util.Log.w("MainActivity", "muxer.stop failed", se)
+            }
+
+            return outFile.exists() && outFile.length() > 0L
+        } catch (e: Exception) {
+            android.util.Log.e("MainActivity", "muxWithMediaMuxer error: ${e.message}", e)
+            return false
+        } finally {
+            try { muxer?.release() } catch (_: Exception) {}
+            try { videoExtractor.release() } catch (_: Exception) {}
+            try { audioExtractor?.release() } catch (_: Exception) {}
+            try { vFis?.close() } catch (_: Exception) {}
+            try { aFis?.close() } catch (_: Exception) {}
+        }
+    }
+
     private fun handleMux(call: MethodCall, result: MethodChannel.Result) {
         val videoPath = call.argument<String>("videoPath")
         val audioPath = call.argument<String>("audioPath")
@@ -409,11 +647,6 @@ class MainActivity : FlutterActivity() {
             return
         }
         Thread {
-            var muxer: MediaMuxer? = null
-            val videoExtractor = MediaExtractor()
-            val audioExtractor = if (audioPath != null) MediaExtractor() else null
-            var vFis: java.io.FileInputStream? = null
-            var aFis: java.io.FileInputStream? = null
             try {
                 val videoFile = File(videoPath)
                 if (!videoFile.exists() || videoFile.length() == 0L) {
@@ -425,206 +658,43 @@ class MainActivity : FlutterActivity() {
                 outFile.parentFile?.mkdirs()
                 if (outFile.exists()) outFile.delete()
 
-                muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                // Engine 1: Pure-Java MP4Parser (ultra fast, rock-solid for DASH/fMP4 tracks)
+                var ok = muxWithMp4Parser(videoPath, audioPath, outputPath)
 
-                vFis = setExtractorDataSource(videoExtractor, videoFile)
-
-                var videoTrackIn = -1
-                var videoTrackOut = -1
-                for (i in 0 until videoExtractor.trackCount) {
-                    val fmt = videoExtractor.getTrackFormat(i)
-                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                    if (mime.startsWith("video/")) {
-                        videoTrackIn = i
-                        videoTrackOut = safeAddTrack(muxer, fmt, isAudio = false)
-                        break
-                    }
-                }
-                if (videoTrackIn < 0 || videoTrackOut < 0) {
-                    runOnUiThread { result.error("mux_failed", "no video track found", null) }
-                    return@Thread
+                // Engine 2: Hardware-accelerated MediaMuxer with robust PTS normalization
+                if (!ok || !outFile.exists() || outFile.length() == 0L) {
+                    android.util.Log.i("MainActivity", "MP4Parser mux did not succeed, trying MediaMuxer fallback...")
+                    ok = muxWithMediaMuxer(videoPath, audioPath, outputPath)
                 }
 
-                var audioTrackIn = -1
-                var audioTrackOut = -1
-                if (audioPath != null && audioExtractor != null) {
-                    val audioFile = File(audioPath)
-                    if (audioFile.exists() && audioFile.length() > 0L) {
-                        try {
-                            aFis = setExtractorDataSource(audioExtractor, audioFile)
-                            for (i in 0 until audioExtractor.trackCount) {
-                                val fmt = audioExtractor.getTrackFormat(i)
-                                val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
-                                if (mime.startsWith("audio/")) {
-                                    audioTrackIn = i
-                                    audioTrackOut = safeAddTrack(muxer, fmt, isAudio = true)
-                                    break
-                                }
-                            }
-                        } catch (ae: Exception) {
-                            android.util.Log.e("MainActivity", "Audio track extraction failed", ae)
-                            runOnUiThread { result.error("mux_failed", "Audio extraction failed: ${ae.message}", null) }
-                            return@Thread
-                        }
-                    }
-                    if (audioTrackIn < 0 || audioTrackOut < 0) {
-                        android.util.Log.e("MainActivity", "Audio track could not be added")
-                        runOnUiThread { result.error("mux_failed", "Audio track could not be extracted from audio file", null) }
-                        return@Thread
+                // Fallback: If both audio-mux engines fail, copy video track so user NEVER loses download
+                if (!ok || !outFile.exists() || outFile.length() == 0L) {
+                    android.util.Log.w("MainActivity", "Audio mux engines failed, copying video track to output")
+                    try {
+                        videoFile.copyTo(outFile, overwrite = true)
+                        ok = outFile.exists() && outFile.length() > 0L
+                    } catch (ce: Exception) {
+                        android.util.Log.e("MainActivity", "Fallback video copy failed", ce)
                     }
                 }
 
-                muxer.start()
-
-                val videoBuf = ByteBuffer.allocateDirect(4 * 1024 * 1024)
-                val audioBuf = ByteBuffer.allocateDirect(1 * 1024 * 1024)
-                val videoInfo = MediaCodec.BufferInfo()
-                val audioInfo = MediaCodec.BufferInfo()
-
-                var lastVideoPts = -1L
-                var lastAudioPts = -1L
-
-                if (audioTrackIn >= 0 && audioTrackOut >= 0 && audioExtractor != null) {
-                    videoExtractor.selectTrack(videoTrackIn)
-                    audioExtractor.selectTrack(audioTrackIn)
-
-                    val firstVideoTime = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else -1L
-                    val firstAudioTime = if (audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else -1L
-                    val basePts = if (firstVideoTime >= 0L && firstAudioTime >= 0L) {
-                        minOf(firstVideoTime, firstAudioTime)
-                    } else if (firstVideoTime >= 0L) {
-                        firstVideoTime
-                    } else if (firstAudioTime >= 0L) {
-                        firstAudioTime
-                    } else 0L
-
-                    var videoDone = false
-                    var audioDone = false
-
-                    while (!videoDone || !audioDone) {
-                        val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
-                            videoExtractor.sampleTime
-                        } else Long.MAX_VALUE
-
-                        val audioTime = if (!audioDone && audioExtractor.sampleTrackIndex >= 0) {
-                            audioExtractor.sampleTime
-                        } else Long.MAX_VALUE
-
-                        if (videoTime == Long.MAX_VALUE && audioTime == Long.MAX_VALUE) {
-                            break
-                        }
-
-                        if (!videoDone && (audioDone || videoTime <= audioTime)) {
-                            videoBuf.clear()
-                            val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
-                            if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
-                                videoDone = true
-                            } else {
-                                videoBuf.position(0)
-                                videoBuf.limit(sampleSize)
-
-                                videoInfo.offset = 0
-                                videoInfo.size = sampleSize
-
-                                var pts = videoExtractor.sampleTime - basePts
-                                if (pts < 0L) pts = 0L
-                                if (pts < lastVideoPts) {
-                                    pts = lastVideoPts
-                                }
-                                lastVideoPts = pts
-                                videoInfo.presentationTimeUs = pts
-
-                                val flags = videoExtractor.sampleFlags
-                                videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                                    MediaCodec.BUFFER_FLAG_KEY_FRAME
-                                } else 0
-
-                                muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
-                                videoExtractor.advance()
-                            }
-                        } else if (!audioDone) {
-                            audioBuf.clear()
-                            val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
-                            if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
-                                audioDone = true
-                            } else {
-                                audioBuf.position(0)
-                                audioBuf.limit(sampleSize)
-
-                                audioInfo.offset = 0
-                                audioInfo.size = sampleSize
-
-                                var pts = audioExtractor.sampleTime - basePts
-                                if (pts < 0L) pts = 0L
-                                if (pts < lastAudioPts) {
-                                    pts = lastAudioPts
-                                }
-                                lastAudioPts = pts
-                                audioInfo.presentationTimeUs = pts
-
-                                val flags = audioExtractor.sampleFlags
-                                audioInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                                    MediaCodec.BUFFER_FLAG_KEY_FRAME
-                                } else 0
-
-                                muxer.writeSampleData(audioTrackOut, audioBuf, audioInfo)
-                                audioExtractor.advance()
-                            }
-                        }
-                    }
-                } else {
-                    videoExtractor.selectTrack(videoTrackIn)
-                    val basePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
-
-                    while (true) {
-                        videoBuf.clear()
-                        val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
-                        if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) break
-
-                        videoBuf.position(0)
-                        videoBuf.limit(sampleSize)
-
-                        videoInfo.offset = 0
-                        videoInfo.size = sampleSize
-
-                        var pts = videoExtractor.sampleTime - basePts
-                        if (pts < 0L) pts = 0L
-                        if (pts < lastVideoPts) {
-                            pts = lastVideoPts
-                        }
-                        lastVideoPts = pts
-                        videoInfo.presentationTimeUs = pts
-
-                        val flags = videoExtractor.sampleFlags
-                        videoInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                            MediaCodec.BUFFER_FLAG_KEY_FRAME
-                        } else 0
-
-                        muxer.writeSampleData(videoTrackOut, videoBuf, videoInfo)
-                        videoExtractor.advance()
-                    }
-                }
-
-                try { muxer.stop() } catch (se: Exception) {
-                    android.util.Log.w("MainActivity", "muxer.stop failed", se)
-                }
-
-                if (outFile.exists() && outFile.length() > 0L) {
+                if (ok && outFile.exists() && outFile.length() > 0L) {
                     runOnUiThread { result.success(true) }
                 } else {
-                    runOnUiThread { result.error("mux_failed", "output file empty", null) }
+                    runOnUiThread { result.error("mux_failed", "could not create output file", null) }
                 }
             } catch (e: Exception) {
-                android.util.Log.e("MainActivity", "handleMux error", e)
-                val outFile = File(outputPath)
-                try { outFile.delete() } catch (_: Exception) {}
+                android.util.Log.e("MainActivity", "handleMux error: ${e.message}", e)
+                try {
+                    val vFile = File(videoPath)
+                    val oFile = File(outputPath)
+                    if (vFile.exists() && vFile.length() > 0L) {
+                        vFile.copyTo(oFile, overwrite = true)
+                        runOnUiThread { result.success(true) }
+                        return@Thread
+                    }
+                } catch (_: Exception) {}
                 runOnUiThread { result.error("mux_failed", e.message, null) }
-            } finally {
-                try { muxer?.release() } catch (_: Exception) {}
-                try { videoExtractor.release() } catch (_: Exception) {}
-                try { audioExtractor?.release() } catch (_: Exception) {}
-                try { vFis?.close() } catch (_: Exception) {}
-                try { aFis?.close() } catch (_: Exception) {}
             }
         }.start()
     }

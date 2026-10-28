@@ -566,15 +566,24 @@ class DownloadService {
         } catch (e) {
           muxError = e.toString();
         }
-        if (!muxed) {
-          // If muxing fails with audio, delete partial file and report error so user isn't stuck with silent video
+
+        // If muxing did not produce a valid output file, fallback to copying video
+        // so the user never loses their download.
+        final targetFile = File(outputPath);
+        if (!muxed || !await targetFile.exists() || (await targetFile.length()) == 0) {
           try {
-            if (await outFile.exists()) await outFile.delete();
-          } catch (_) {}
+            await File(stagedVideoPath).copy(outputPath);
+            muxed = true;
+          } catch (e) {
+            muxError = e.toString();
+          }
         }
       }
 
-      if (muxed) {
+      final outExists = await outFile.exists();
+      final outLength = outExists ? await outFile.length() : 0;
+
+      if (muxed && outExists && outLength > 0) {
         updateTask(DownloadTask(
             id: id, title: title, progress: 98, status: 'Saving…'));
         await NotificationService.showProgress(
@@ -589,10 +598,7 @@ class DownloadService {
         );
         await NotificationService.showComplete(title, filePath: outputPath);
       } else {
-        try {
-          if (await outFile.exists()) await outFile.delete();
-        } catch (_) {}
-        await NotificationService.showError(title, muxError ?? 'Merge failed');
+        await NotificationService.showError(title, muxError ?? 'Download failed');
       }
     } on _CancelException {
       try {

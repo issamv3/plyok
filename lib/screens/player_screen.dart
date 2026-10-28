@@ -2318,6 +2318,7 @@ class _DownloadQualitySheet extends StatefulWidget {
 class _DownloadQualitySheetState extends State<_DownloadQualitySheet> {
   late final TextEditingController _titleCtrl;
   DashRepresentation? _selectedRep;
+  bool _submitted = false;
 
   @override
   void initState() {
@@ -2585,6 +2586,8 @@ class _DownloadQualitySheetState extends State<_DownloadQualitySheet> {
                     ),
                   ),
                   onPressed: () {
+                    if (_submitted) return;
+                    _submitted = true;
                     final raw = _titleCtrl.text.trim();
                     final title = raw.isEmpty ? widget.initialTitle : raw;
                     Navigator.of(context).pop();
