@@ -1,11 +1,11 @@
 package com.ply.mpd.network
 
 import android.content.Context
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.util.Log
+import org.mp4parser.muxer.Movie
+import org.mp4parser.muxer.Track
+import org.mp4parser.muxer.builder.DefaultMp4Builder
+import org.mp4parser.muxer.container.mp4.MovieCreator
 import com.ply.mpd.data.models.DownloadItem
 import com.ply.mpd.data.models.DownloadStatus
 import com.ply.mpd.data.storage.AppStorage
@@ -336,7 +336,7 @@ class DownloadManager private constructor(private val context: Context) {
                 }
             }
 
-            // 3. Multiplex video and audio into final MP4 using fast, safe MediaMuxer
+            // 3. Multiplex video and audio into final MP4 using pure-Java MP4Parser
             appStorage.saveDownload(item.copy(progress = 96, status = DownloadStatus.DOWNLOADING))
             val hasValidAudio = audioPart.exists() && audioPart.length() > 0L
 
@@ -372,7 +372,7 @@ class DownloadManager private constructor(private val context: Context) {
     }
 
     /**
-     * Fast, lightweight MediaMuxer merging with constant low-memory footprint
+     * Pure Java MP4Parser multiplexing of video and audio tracks
      */
     private fun muxStreams(videoFile: File, audioFile: File, outputFile: File) {
         if (!videoFile.exists() || videoFile.length() == 0L) return
@@ -382,137 +382,79 @@ class DownloadManager private constructor(private val context: Context) {
             return
         }
 
-        var muxer: MediaMuxer? = null
-        val videoExtractor = MediaExtractor()
-        val audioExtractor = MediaExtractor()
-        var vFis: java.io.FileInputStream? = null
-        var aFis: java.io.FileInputStream? = null
-
         try {
-            vFis = java.io.FileInputStream(videoFile)
-            videoExtractor.setDataSource(vFis.fd)
+            val videoMovie: Movie = MovieCreator.build(videoFile.absolutePath)
+            val audioMovie: Movie = MovieCreator.build(audioFile.absolutePath)
 
-            var videoSourceTrack = -1
-            for (i in 0 until videoExtractor.trackCount) {
-                val format = videoExtractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("video/")) {
-                    videoSourceTrack = i
-                    break
+            val resultMovie = Movie()
+            resultMovie.matrix = videoMovie.matrix
+
+            // 1. Add video tracks from videoMovie
+            var videoTrackAdded = false
+            for (track in videoMovie.tracks) {
+                val handler = track.handler?.lowercase() ?: ""
+                if (handler == "vide") {
+                    resultMovie.addTrack(track)
+                    videoTrackAdded = true
                 }
             }
-
-            if (videoSourceTrack < 0) {
-                videoFile.copyTo(outputFile, overwrite = true)
-                return
-            }
-
-            aFis = java.io.FileInputStream(audioFile)
-            audioExtractor.setDataSource(aFis.fd)
-
-            var audioSourceTrack = -1
-            for (i in 0 until audioExtractor.trackCount) {
-                val format = audioExtractor.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                if (mime.startsWith("audio/")) {
-                    audioSourceTrack = i
-                    break
-                }
-            }
-
-            if (audioSourceTrack < 0) {
-                videoFile.copyTo(outputFile, overwrite = true)
-                return
-            }
-
-            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val videoTrackIndex = muxer.addTrack(videoExtractor.getTrackFormat(videoSourceTrack))
-            val audioTrackIndex = muxer.addTrack(audioExtractor.getTrackFormat(audioSourceTrack))
-            muxer.start()
-
-            videoExtractor.selectTrack(videoSourceTrack)
-            audioExtractor.selectTrack(audioSourceTrack)
-
-            val bufferSize = 512 * 1024 // 512 KB direct buffer is fast and light
-            val buffer = ByteBuffer.allocateDirect(bufferSize)
-            val bufferInfo = MediaCodec.BufferInfo()
-
-            val vBasePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
-            val aBasePts = if (audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else 0L
-
-            var videoDone = false
-            var audioDone = false
-            var lastVideoPts = -1L
-            var lastAudioPts = -1L
-
-            while (!videoDone || !audioDone) {
-                val vTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
-                    val t = videoExtractor.sampleTime - vBasePts
-                    if (t < 0L) 0L else t
-                } else Long.MAX_VALUE
-
-                val aTime = if (!audioDone && audioExtractor.sampleTrackIndex >= 0) {
-                    val t = audioExtractor.sampleTime - aBasePts
-                    if (t < 0L) 0L else t
-                } else Long.MAX_VALUE
-
-                if (vTime == Long.MAX_VALUE && aTime == Long.MAX_VALUE) break
-
-                if (!videoDone && (audioDone || vTime <= aTime)) {
-                    buffer.clear()
-                    val sampleSize = videoExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
-                        videoDone = true
-                    } else {
-                        bufferInfo.offset = 0
-                        bufferInfo.size = sampleSize
-                        var pts = vTime
-                        if (pts <= lastVideoPts) pts = lastVideoPts + 1000L
-                        lastVideoPts = pts
-                        bufferInfo.presentationTimeUs = pts
-                        bufferInfo.flags = if ((videoExtractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                            MediaCodec.BUFFER_FLAG_KEY_FRAME
-                        } else 0
-                        muxer.writeSampleData(videoTrackIndex, buffer, bufferInfo)
-                        videoExtractor.advance()
-                    }
-                } else if (!audioDone) {
-                    buffer.clear()
-                    val sampleSize = audioExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
-                        audioDone = true
-                    } else {
-                        bufferInfo.offset = 0
-                        bufferInfo.size = sampleSize
-                        var pts = aTime
-                        if (pts <= lastAudioPts) pts = lastAudioPts + 1000L
-                        lastAudioPts = pts
-                        bufferInfo.presentationTimeUs = pts
-                        bufferInfo.flags = if ((audioExtractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
-                            MediaCodec.BUFFER_FLAG_KEY_FRAME
-                        } else 0
-                        muxer.writeSampleData(audioTrackIndex, buffer, bufferInfo)
-                        audioExtractor.advance()
+            if (!videoTrackAdded) {
+                for (track in videoMovie.tracks) {
+                    val handler = track.handler?.lowercase() ?: ""
+                    if (handler != "soun") {
+                        resultMovie.addTrack(track)
+                        videoTrackAdded = true
                     }
                 }
             }
+            if (!videoTrackAdded && videoMovie.tracks.isNotEmpty()) {
+                resultMovie.addTrack(videoMovie.tracks[0])
+                videoTrackAdded = true
+            }
 
-            try { muxer.stop() } catch (_: Throwable) {}
+            // 2. Add audio tracks from audioMovie
+            var audioTrackAdded = false
+            for (track in audioMovie.tracks) {
+                val handler = track.handler?.lowercase() ?: ""
+                if (handler == "soun" || handler == "audio") {
+                    resultMovie.addTrack(track)
+                    audioTrackAdded = true
+                }
+            }
+            if (!audioTrackAdded) {
+                for (track in audioMovie.tracks) {
+                    val handler = track.handler?.lowercase() ?: ""
+                    if (handler != "vide") {
+                        resultMovie.addTrack(track)
+                        audioTrackAdded = true
+                    }
+                }
+            }
+            if (!audioTrackAdded && audioMovie.tracks.isNotEmpty()) {
+                resultMovie.addTrack(audioMovie.tracks[0])
+                audioTrackAdded = true
+            }
+
+            val outContainer = DefaultMp4Builder().build(resultMovie)
+            FileOutputStream(outputFile).use { fos ->
+                fos.channel.use { channel ->
+                    outContainer.writeContainer(channel)
+                }
+            }
+
+            if (outputFile.exists() && outputFile.length() > 0L) {
+                return
+            }
         } catch (t: Throwable) {
-            Log.w("DownloadManager", "muxStreams error: ${t.message}", t)
-        } finally {
-            try { muxer?.release() } catch (_: Throwable) {}
-            try { videoExtractor.release() } catch (_: Throwable) {}
-            try { audioExtractor.release() } catch (_: Throwable) {}
-            try { vFis?.close() } catch (_: Throwable) {}
-            try { aFis?.close() } catch (_: Throwable) {}
+            Log.e("DownloadManager", "MP4Parser muxStreams error: ${t.message}", t)
         }
 
-        if (!outputFile.exists() || outputFile.length() == 0L) {
-            try {
+        // Fallback: Copy video directly if muxing failed
+        try {
+            if (!outputFile.exists() || outputFile.length() == 0L) {
                 videoFile.copyTo(outputFile, overwrite = true)
-            } catch (_: Throwable) {}
-        }
+            }
+        } catch (_: Throwable) {}
     }
 
     companion object {
