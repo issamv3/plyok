@@ -289,37 +289,17 @@ class DownloadManager private constructor(private val context: Context) {
         var audioBytes = 0L
         var audioTotal = 1L
 
-        // 1. Download Video Stream
-        downloadFileWithResume(
-            initialUrl = item.videoUrl,
-            destFile = videoPart,
-            originalFbUrl = item.originalFbUrl,
-            fbVideoId = item.fbVideoId
-        ) { bytesRead, totalBytes ->
-            videoBytes = bytesRead
-            videoTotal = if (totalBytes > 0) totalBytes else videoTotal
-            val overallProgress = ((videoBytes * 80) / videoTotal).toInt().coerceIn(0, 80)
-            appStorage.saveDownload(
-                item.copy(
-                    progress = overallProgress,
-                    bytesDownloaded = videoBytes + audioBytes,
-                    totalBytes = videoTotal + audioTotal,
-                    status = DownloadStatus.DOWNLOADING
-                )
-            )
-        }
-
-        // 2. Download Audio Stream
-        if (!item.audioUrl.isNullOrBlank()) {
+        try {
+            // 1. Download Video Stream
             downloadFileWithResume(
-                initialUrl = item.audioUrl,
-                destFile = audioPart,
+                initialUrl = item.videoUrl,
+                destFile = videoPart,
                 originalFbUrl = item.originalFbUrl,
                 fbVideoId = item.fbVideoId
             ) { bytesRead, totalBytes ->
-                audioBytes = bytesRead
-                audioTotal = if (totalBytes > 0) totalBytes else audioTotal
-                val overallProgress = (80 + ((audioBytes * 15) / audioTotal).toInt()).coerceIn(80, 95)
+                videoBytes = bytesRead
+                videoTotal = if (totalBytes > 0) totalBytes else videoTotal
+                val overallProgress = ((videoBytes * 80) / videoTotal).toInt().coerceIn(0, 80)
                 appStorage.saveDownload(
                     item.copy(
                         progress = overallProgress,
@@ -329,161 +309,209 @@ class DownloadManager private constructor(private val context: Context) {
                     )
                 )
             }
-        }
 
-        // 3. Multiplex video and audio into final MP4 using MediaMuxer with interleaved samples
-        appStorage.saveDownload(item.copy(progress = 96, status = DownloadStatus.DOWNLOADING))
-        try {
-            muxStreams(videoPart, audioPart, finalFile)
-        } catch (e: Exception) {
-            Log.w("DownloadManager", "Muxing streams failed, falling back to video stream directly", e)
-            if (videoPart.exists() && (!finalFile.exists() || finalFile.length() == 0L)) {
-                videoPart.copyTo(finalFile, overwrite = true)
+            // 2. Download Audio Stream (optional/resilient: if audio fails, still save video)
+            if (!item.audioUrl.isNullOrBlank()) {
+                try {
+                    downloadFileWithResume(
+                        initialUrl = item.audioUrl,
+                        destFile = audioPart,
+                        originalFbUrl = item.originalFbUrl,
+                        fbVideoId = item.fbVideoId
+                    ) { bytesRead, totalBytes ->
+                        audioBytes = bytesRead
+                        audioTotal = if (totalBytes > 0) totalBytes else audioTotal
+                        val overallProgress = (80 + ((audioBytes * 15) / audioTotal).toInt()).coerceIn(80, 95)
+                        appStorage.saveDownload(
+                            item.copy(
+                                progress = overallProgress,
+                                bytesDownloaded = videoBytes + audioBytes,
+                                totalBytes = videoTotal + audioTotal,
+                                status = DownloadStatus.DOWNLOADING
+                            )
+                        )
+                    }
+                } catch (e: Exception) {
+                    Log.w("DownloadManager", "Audio download failed, proceeding with video only: ${e.message}")
+                }
             }
-        }
 
-        // Cleanup part files
-        videoPart.delete()
-        audioPart.delete()
+            // 3. Multiplex video and audio into final MP4 using fast, safe MediaMuxer
+            appStorage.saveDownload(item.copy(progress = 96, status = DownloadStatus.DOWNLOADING))
+            val hasValidAudio = audioPart.exists() && audioPart.length() > 0L
 
-        appStorage.saveDownload(
-            item.copy(
-                progress = 100,
-                bytesDownloaded = finalFile.length(),
-                totalBytes = finalFile.length(),
-                status = DownloadStatus.COMPLETED
+            if (hasValidAudio) {
+                try {
+                    muxStreams(videoPart, audioPart, finalFile)
+                } catch (t: Throwable) {
+                    Log.w("DownloadManager", "Muxing streams failed, falling back to direct video copy", t)
+                    if (videoPart.exists() && (!finalFile.exists() || finalFile.length() == 0L)) {
+                        videoPart.copyTo(finalFile, overwrite = true)
+                    }
+                }
+            } else {
+                // No audio or single stream: copy video directly
+                if (videoPart.exists()) {
+                    videoPart.copyTo(finalFile, overwrite = true)
+                }
+            }
+
+            appStorage.saveDownload(
+                item.copy(
+                    progress = 100,
+                    bytesDownloaded = finalFile.length(),
+                    totalBytes = finalFile.length(),
+                    status = DownloadStatus.COMPLETED
+                )
             )
-        )
+        } finally {
+            // Always clean up temporary files without leaving orphaned .part files
+            try { if (videoPart.exists()) videoPart.delete() } catch (_: Throwable) {}
+            try { if (audioPart.exists()) audioPart.delete() } catch (_: Throwable) {}
+        }
     }
 
     /**
-     * Mux video and audio by interleaving sample buffers based on presentation timestamps
+     * Fast, lightweight MediaMuxer merging with constant low-memory footprint
      */
     private fun muxStreams(videoFile: File, audioFile: File, outputFile: File) {
+        if (!videoFile.exists() || videoFile.length() == 0L) return
+
+        if (!audioFile.exists() || audioFile.length() == 0L) {
+            videoFile.copyTo(outputFile, overwrite = true)
+            return
+        }
+
+        var muxer: MediaMuxer? = null
         val videoExtractor = MediaExtractor()
-        val audioExtractor = if (audioFile.exists() && audioFile.length() > 0) MediaExtractor() else null
+        val audioExtractor = MediaExtractor()
         var vFis: java.io.FileInputStream? = null
         var aFis: java.io.FileInputStream? = null
-
-        val muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
         try {
             vFis = java.io.FileInputStream(videoFile)
             videoExtractor.setDataSource(vFis.fd)
 
-            var videoTrackIndex = -1
             var videoSourceTrack = -1
             for (i in 0 until videoExtractor.trackCount) {
                 val format = videoExtractor.getTrackFormat(i)
                 val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
                 if (mime.startsWith("video/")) {
                     videoSourceTrack = i
-                    videoTrackIndex = muxer.addTrack(format)
                     break
                 }
             }
 
-            var audioTrackIndex = -1
+            if (videoSourceTrack < 0) {
+                videoFile.copyTo(outputFile, overwrite = true)
+                return
+            }
+
+            aFis = java.io.FileInputStream(audioFile)
+            audioExtractor.setDataSource(aFis.fd)
+
             var audioSourceTrack = -1
-            if (audioExtractor != null) {
-                aFis = java.io.FileInputStream(audioFile)
-                audioExtractor.setDataSource(aFis.fd)
-                for (i in 0 until audioExtractor.trackCount) {
-                    val format = audioExtractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
-                    if (mime.startsWith("audio/")) {
-                        audioSourceTrack = i
-                        audioTrackIndex = muxer.addTrack(format)
-                        break
-                    }
+            for (i in 0 until audioExtractor.trackCount) {
+                val format = audioExtractor.getTrackFormat(i)
+                val mime = format.getString(MediaFormat.KEY_MIME) ?: ""
+                if (mime.startsWith("audio/")) {
+                    audioSourceTrack = i
+                    break
                 }
             }
 
+            if (audioSourceTrack < 0) {
+                videoFile.copyTo(outputFile, overwrite = true)
+                return
+            }
+
+            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val videoTrackIndex = muxer.addTrack(videoExtractor.getTrackFormat(videoSourceTrack))
+            val audioTrackIndex = muxer.addTrack(audioExtractor.getTrackFormat(audioSourceTrack))
             muxer.start()
 
-            if (videoSourceTrack >= 0) {
-                videoExtractor.selectTrack(videoSourceTrack)
-            }
-            if (audioExtractor != null && audioSourceTrack >= 0) {
-                audioExtractor.selectTrack(audioSourceTrack)
-            }
+            videoExtractor.selectTrack(videoSourceTrack)
+            audioExtractor.selectTrack(audioSourceTrack)
 
-            val bufferSize = 2 * 1024 * 1024
-            val videoBuf = ByteBuffer.allocateDirect(bufferSize)
-            val audioBuf = ByteBuffer.allocateDirect(bufferSize)
-            val videoBufferInfo = MediaCodec.BufferInfo()
-            val audioBufferInfo = MediaCodec.BufferInfo()
+            val bufferSize = 512 * 1024 // 512 KB direct buffer is fast and light
+            val buffer = ByteBuffer.allocateDirect(bufferSize)
+            val bufferInfo = MediaCodec.BufferInfo()
 
-            var videoDone = (videoSourceTrack < 0)
-            var audioDone = (audioSourceTrack < 0 || audioExtractor == null)
+            val vBasePts = if (videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else 0L
+            val aBasePts = if (audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else 0L
+
+            var videoDone = false
+            var audioDone = false
             var lastVideoPts = -1L
             var lastAudioPts = -1L
 
             while (!videoDone || !audioDone) {
-                val videoTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) videoExtractor.sampleTime else Long.MAX_VALUE
-                val audioTime = if (!audioDone && audioExtractor != null && audioExtractor.sampleTrackIndex >= 0) audioExtractor.sampleTime else Long.MAX_VALUE
+                val vTime = if (!videoDone && videoExtractor.sampleTrackIndex >= 0) {
+                    val t = videoExtractor.sampleTime - vBasePts
+                    if (t < 0L) 0L else t
+                } else Long.MAX_VALUE
 
-                if (!videoDone && (audioDone || (videoTime != Long.MAX_VALUE && (audioTime == Long.MAX_VALUE || videoTime <= audioTime)))) {
-                    videoBuf.clear()
-                    val sampleSize = videoExtractor.readSampleData(videoBuf, 0)
+                val aTime = if (!audioDone && audioExtractor.sampleTrackIndex >= 0) {
+                    val t = audioExtractor.sampleTime - aBasePts
+                    if (t < 0L) 0L else t
+                } else Long.MAX_VALUE
+
+                if (vTime == Long.MAX_VALUE && aTime == Long.MAX_VALUE) break
+
+                if (!videoDone && (audioDone || vTime <= aTime)) {
+                    buffer.clear()
+                    val sampleSize = videoExtractor.readSampleData(buffer, 0)
                     if (sampleSize < 0 || videoExtractor.sampleTrackIndex < 0) {
                         videoDone = true
                     } else {
-                        videoBuf.position(0)
-                        videoBuf.limit(sampleSize)
-
-                        videoBufferInfo.offset = 0
-                        videoBufferInfo.size = sampleSize
-
-                        var pts = videoExtractor.sampleTime
-                        if (pts < 0L) pts = 0L
+                        bufferInfo.offset = 0
+                        bufferInfo.size = sampleSize
+                        var pts = vTime
                         if (pts <= lastVideoPts) pts = lastVideoPts + 1000L
                         lastVideoPts = pts
-                        videoBufferInfo.presentationTimeUs = pts
-
-                        val flags = videoExtractor.sampleFlags
-                        videoBufferInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                        bufferInfo.presentationTimeUs = pts
+                        bufferInfo.flags = if ((videoExtractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
                             MediaCodec.BUFFER_FLAG_KEY_FRAME
                         } else 0
-
-                        muxer.writeSampleData(videoTrackIndex, videoBuf, videoBufferInfo)
+                        muxer.writeSampleData(videoTrackIndex, buffer, bufferInfo)
                         videoExtractor.advance()
                     }
-                } else if (!audioDone && audioExtractor != null) {
-                    audioBuf.clear()
-                    val sampleSize = audioExtractor.readSampleData(audioBuf, 0)
+                } else if (!audioDone) {
+                    buffer.clear()
+                    val sampleSize = audioExtractor.readSampleData(buffer, 0)
                     if (sampleSize < 0 || audioExtractor.sampleTrackIndex < 0) {
                         audioDone = true
                     } else {
-                        audioBuf.position(0)
-                        audioBuf.limit(sampleSize)
-
-                        audioBufferInfo.offset = 0
-                        audioBufferInfo.size = sampleSize
-
-                        var pts = audioExtractor.sampleTime
-                        if (pts < 0L) pts = 0L
+                        bufferInfo.offset = 0
+                        bufferInfo.size = sampleSize
+                        var pts = aTime
                         if (pts <= lastAudioPts) pts = lastAudioPts + 1000L
                         lastAudioPts = pts
-                        audioBufferInfo.presentationTimeUs = pts
-
-                        val flags = audioExtractor.sampleFlags
-                        audioBufferInfo.flags = if ((flags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
+                        bufferInfo.presentationTimeUs = pts
+                        bufferInfo.flags = if ((audioExtractor.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) {
                             MediaCodec.BUFFER_FLAG_KEY_FRAME
                         } else 0
-
-                        muxer.writeSampleData(audioTrackIndex, audioBuf, audioBufferInfo)
+                        muxer.writeSampleData(audioTrackIndex, buffer, bufferInfo)
                         audioExtractor.advance()
                     }
                 }
             }
+
+            try { muxer.stop() } catch (_: Throwable) {}
+        } catch (t: Throwable) {
+            Log.w("DownloadManager", "muxStreams error: ${t.message}", t)
         } finally {
-            try { muxer.stop() } catch (_: Exception) {}
-            try { muxer.release() } catch (_: Exception) {}
-            try { videoExtractor.release() } catch (_: Exception) {}
-            try { audioExtractor?.release() } catch (_: Exception) {}
-            try { vFis?.close() } catch (_: Exception) {}
-            try { aFis?.close() } catch (_: Exception) {}
+            try { muxer?.release() } catch (_: Throwable) {}
+            try { videoExtractor.release() } catch (_: Throwable) {}
+            try { audioExtractor.release() } catch (_: Throwable) {}
+            try { vFis?.close() } catch (_: Throwable) {}
+            try { aFis?.close() } catch (_: Throwable) {}
+        }
+
+        if (!outputFile.exists() || outputFile.length() == 0L) {
+            try {
+                videoFile.copyTo(outputFile, overwrite = true)
+            } catch (_: Throwable) {}
         }
     }
 

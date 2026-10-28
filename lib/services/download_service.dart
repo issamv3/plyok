@@ -453,6 +453,9 @@ class DownloadService {
       final stagedVideoPath = '${persistentTempDir.path}/${id}_video.mp4';
       final stagedAudioPath =
           audioUrl != null ? '${persistentTempDir.path}/${id}_audio.mp4' : null;
+      stagedFiles.add(File(stagedVideoPath));
+      if (stagedAudioPath != null) stagedFiles.add(File(stagedAudioPath));
+
       await NotificationService.showProgress(
           title: title, body: 'Downloading… 0%', progress: 0);
       final videoWeight = audioUrl != null ? 0.7 : 1.0;
@@ -506,36 +509,39 @@ class DownloadService {
           }
         },
       );
-      stagedFiles.add(File(stagedVideoPath));
+
       if (audioUrl != null && stagedAudioPath != null) {
-        await _downloadToFile(
-          audioUrl,
-          stagedAudioPath,
-          job: job,
-          onRefreshExpiredUrl: () => refreshFacebookTrack(isAudio: true),
-          onProgress: (received, total, speedBps) {
-            if (total == null || total <= 0) return;
-            final pct =
-                ((videoWeight + received / total * audioWeight) * 100)
-                    .clamp(0, 89)
-                    .toInt();
-            if (pct > lastPct) {
-              lastPct = pct;
-              updateTask(DownloadTask(
-                id: id,
-                title: title,
-                progress: pct,
-                status: 'Downloading…',
-                speedBps: speedBps,
-                thumbnailPath: thumbnailPath,
-                isPaused: job.pauseRequested,
-              ));
-              unawaited(NotificationService.showProgress(
-                title: title, body: 'Downloading… $pct%', progress: pct));
-            }
-          },
-        );
-        stagedFiles.add(File(stagedAudioPath));
+        try {
+          await _downloadToFile(
+            audioUrl,
+            stagedAudioPath,
+            job: job,
+            onRefreshExpiredUrl: () => refreshFacebookTrack(isAudio: true),
+            onProgress: (received, total, speedBps) {
+              if (total == null || total <= 0) return;
+              final pct =
+                  ((videoWeight + received / total * audioWeight) * 100)
+                      .clamp(0, 89)
+                      .toInt();
+              if (pct > lastPct) {
+                lastPct = pct;
+                updateTask(DownloadTask(
+                  id: id,
+                  title: title,
+                  progress: pct,
+                  status: 'Downloading…',
+                  speedBps: speedBps,
+                  thumbnailPath: thumbnailPath,
+                  isPaused: job.pauseRequested,
+                ));
+                unawaited(NotificationService.showProgress(
+                  title: title, body: 'Downloading… $pct%', progress: pct));
+              }
+            },
+          );
+        } catch (e) {
+          debugPrint('Audio download warning: $e. Proceeding with video track.');
+        }
       }
       if (job.cancelRequested) throw const _CancelException();
       updateTask(DownloadTask(
@@ -549,8 +555,13 @@ class DownloadService {
       var muxed = false;
       String? muxError;
 
-      if (stagedAudioPath == null) {
-        // Single stream already in MP4 container, no remuxing needed
+      final audioFile = stagedAudioPath != null ? File(stagedAudioPath) : null;
+      final hasValidAudio = audioFile != null &&
+          await audioFile.exists() &&
+          (await audioFile.length()) > 0;
+
+      if (!hasValidAudio) {
+        // Single stream or audio unavailable, copy video directly
         await File(stagedVideoPath).copy(outputPath);
         muxed = true;
       } else {
@@ -809,15 +820,19 @@ class DownloadService {
       }
     }
 
-    await DownloadLibraryService.instance.add(DownloadRecord(
-      id: id,
-      title: title,
-      filePath: filePath,
-      durationMs: resolvedDuration,
-      thumbnailPath: thumbnailPath,
-      isDash: isDash,
-      downloadedAtMs: DateTime.now().millisecondsSinceEpoch,
-    ));
+    final existingRecords = await DownloadLibraryService.instance.loadAll();
+    final alreadyExists = existingRecords.any((r) => r.filePath == filePath || r.id == id);
+    if (!alreadyExists) {
+      await DownloadLibraryService.instance.add(DownloadRecord(
+        id: id,
+        title: title,
+        filePath: filePath,
+        durationMs: resolvedDuration,
+        thumbnailPath: thumbnailPath,
+        isDash: isDash,
+        downloadedAtMs: DateTime.now().millisecondsSinceEpoch,
+      ));
+    }
   }
 
   static Future<void> _downloadToFile(
