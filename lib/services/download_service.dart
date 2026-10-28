@@ -457,16 +457,18 @@ class DownloadService {
           await NotificationService.showError(title, 'No video track found');
           return;
         }
-        resolvedVideoUrl = maybeVideoUrl;
-        final audioRep = DashParser.bestAudio(rewrittenMpd);
+        resolvedVideoUrl = maybeVideoUrl.replaceAll('&amp;', '&');
+        final audioRep = DashParser.bestAudio(rewrittenMpd) ?? DashParser.bestAudio(effectiveMpd);
         if (audioRep != null) {
-          audioUrl = audioRep.baseUrl;
+          audioUrl = audioRep.baseUrl.replaceAll('&amp;', '&');
+        } else {
+          audioUrl = (DashParser.extractAudioUrl(rewrittenMpd) ?? DashParser.extractAudioUrl(effectiveMpd))?.replaceAll('&amp;', '&');
         }
       } else {
-        resolvedVideoUrl = await CdnService.raceAndRewrite(
+        resolvedVideoUrl = (await CdnService.raceAndRewrite(
           p.videoPath,
           fbCdnEnabled: p.fbCdnEnabled,
-        );
+        )).replaceAll('&amp;', '&');
       }
       final stagedVideoPath = '${persistentTempDir.path}/${id}_video.mp4';
       final stagedAudioPath =
@@ -492,10 +494,10 @@ class DownloadService {
           );
           if (isAudio) {
             final audioRep = DashParser.bestAudio(effectiveMpd);
-            return audioRep?.baseUrl;
+            return (audioRep?.baseUrl ?? DashParser.extractAudioUrl(effectiveMpd))?.replaceAll('&amp;', '&');
           } else {
             final videoReps = DashParser.parse(effectiveMpd);
-            return resolveVideoUrl(videoReps, p.selectedVideoRep);
+            return resolveVideoUrl(videoReps, p.selectedVideoRep)?.replaceAll('&amp;', '&');
           }
         } catch (_) {
           return null;
@@ -529,37 +531,33 @@ class DownloadService {
       );
 
       if (audioUrl != null && stagedAudioPath != null) {
-        try {
-          await _downloadToFile(
-            audioUrl,
-            stagedAudioPath,
-            job: job,
-            onRefreshExpiredUrl: () => refreshFacebookTrack(isAudio: true),
-            onProgress: (received, total, speedBps) {
-              if (total == null || total <= 0) return;
-              final pct =
-                  ((videoWeight + received / total * audioWeight) * 100)
-                      .clamp(0, 89)
-                      .toInt();
-              if (pct > lastPct) {
-                lastPct = pct;
-                updateTask(DownloadTask(
-                  id: id,
-                  title: title,
-                  progress: pct,
-                  status: 'Downloading…',
-                  speedBps: speedBps,
-                  thumbnailPath: thumbnailPath,
-                  isPaused: job.pauseRequested,
-                ));
-                unawaited(NotificationService.showProgress(
-                  title: title, body: 'Downloading… $pct%', progress: pct));
-              }
-            },
-          );
-        } catch (e) {
-          debugPrint('Audio download warning: $e. Proceeding with video track.');
-        }
+        await _downloadToFile(
+          audioUrl,
+          stagedAudioPath,
+          job: job,
+          onRefreshExpiredUrl: () => refreshFacebookTrack(isAudio: true),
+          onProgress: (received, total, speedBps) {
+            if (total == null || total <= 0) return;
+            final pct =
+                ((videoWeight + received / total * audioWeight) * 100)
+                    .clamp(0, 89)
+                    .toInt();
+            if (pct > lastPct) {
+              lastPct = pct;
+              updateTask(DownloadTask(
+                id: id,
+                title: title,
+                progress: pct,
+                status: 'Downloading…',
+                speedBps: speedBps,
+                thumbnailPath: thumbnailPath,
+                isPaused: job.pauseRequested,
+              ));
+              unawaited(NotificationService.showProgress(
+                title: title, body: 'Downloading… $pct%', progress: pct));
+            }
+          },
+        );
       }
       if (job.cancelRequested) throw const _CancelException();
       updateTask(DownloadTask(
@@ -579,7 +577,9 @@ class DownloadService {
           (await audioFile.length()) > 0;
 
       if (!hasValidAudio) {
-        // Single stream or audio unavailable, copy video directly
+        if (isDash && audioUrl != null) {
+          throw Exception('Audio stream could not be downloaded');
+        }
         await File(stagedVideoPath).copy(outputPath);
         muxed = true;
       } else {
@@ -596,16 +596,9 @@ class DownloadService {
           muxError = e.toString();
         }
 
-        // If muxing did not produce a valid output file, fallback to copying video
-        // so the user never loses their download.
         final targetFile = File(outputPath);
         if (!muxed || !await targetFile.exists() || (await targetFile.length()) == 0) {
-          try {
-            await File(stagedVideoPath).copy(outputPath);
-            muxed = true;
-          } catch (e) {
-            muxError = e.toString();
-          }
+          throw Exception(muxError ?? 'Muxing video and audio tracks failed');
         }
       }
 
