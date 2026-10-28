@@ -424,6 +424,24 @@ class DownloadService {
             final text = await File(p.videoPath).readAsString();
             if (text.contains('<MPD')) effectiveMpd = text;
           } catch (_) {}
+        } else if (p.videoPath.startsWith('http') && (p.isDash || p.videoPath.contains('.mpd'))) {
+          try {
+            final res = await http.get(Uri.parse(p.videoPath)).timeout(const Duration(seconds: 15));
+            if (res.statusCode == 200 && res.body.contains('<MPD')) {
+              effectiveMpd = res.body;
+            }
+          } catch (_) {}
+        }
+        if ((effectiveMpd == null || !effectiveMpd.contains('<MPD')) && (p.fbVideoId != null || p.originalFbUrl != null)) {
+          final target = p.fbVideoId ?? p.originalFbUrl;
+          if (target != null && target.isNotEmpty) {
+            try {
+              final fbRes = await FacebookExtractorService.instance.extract(target);
+              if (fbRes.dashManifest != null && fbRes.dashManifest!.contains('<MPD')) {
+                effectiveMpd = fbRes.dashManifest;
+              }
+            } catch (_) {}
+          }
         }
       }
 

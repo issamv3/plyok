@@ -85,9 +85,4 @@ dependencies {
     // Serialization
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-
-    // MP4Parser for pure-Java MP4 audio+video muxing
-    implementation("org.mp4parser:muxer:1.9.41")
-    implementation("org.mp4parser:isoparser:1.9.41")
-    implementation("org.slf4j:slf4j-android:1.7.36")
 }
