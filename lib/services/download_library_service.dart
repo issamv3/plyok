@@ -54,6 +54,9 @@ class DownloadLibraryService {
     records.add(record);
     await _saveAll(records);
   }
+  Future<void> update(DownloadRecord record) async {
+    await add(record);
+  }
   Future<void> remove(String id) async {
     final records = await loadAll();
     records.removeWhere((e) => e.id == id);

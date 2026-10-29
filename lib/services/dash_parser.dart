@@ -59,9 +59,9 @@ class DashParser {
       }
     }
 
-    // 2. Check Representation with audio attributes
+    // 2. Check Representation with audio attributes or Facebook '...a' ID
     final audioRepPattern = RegExp(
-      r'<Representation[^>]*?(?:contentType=["\x27]audio["\x27]|mimeType=["\x27]audio\/[^"\x27]+["\x27]|codecs=["\x27](?:mp4a|aac)[^"\x27]*["\x27]|audioSamplingRate)[^>]*>([\s\S]*?)<\/Representation>',
+      r'<Representation[^>]*?(?:contentType=["\x27]audio["\x27]|mimeType=["\x27]audio\/[^"\x27]+["\x27]|codecs=["\x27](?:mp4a|aac)[^"\x27]*["\x27]|audioSamplingRate|id=["\x27]\d+a["\x27]|FBEncodingTag=["\x27][^"\x27]*?audio)[^>]*>([\s\S]*?)<\/Representation>',
       caseSensitive: false,
     );
     for (final match in audioRepPattern.allMatches(xmlContent)) {
@@ -313,6 +313,9 @@ class DashParser {
       if (enc.contains('audio') || enc.contains('aac')) return 'audio';
       if (rep.getAttribute('audioSamplingRate') != null) return 'audio';
       if (rep.findElements('AudioChannelConfiguration').isNotEmpty) return 'audio';
+      final repId = rep.getAttribute('id')?.toLowerCase() ?? '';
+      if (repId.endsWith('a') && !repId.endsWith('va')) return 'audio';
+      if (repId.endsWith('v')) return 'video';
       if ((rep.getAttribute('width') != null && rep.getAttribute('width') != '0') ||
           (rep.getAttribute('height') != null && rep.getAttribute('height') != '0')) {
         return 'video';

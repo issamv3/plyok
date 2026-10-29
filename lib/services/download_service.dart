@@ -454,16 +454,53 @@ class DownloadService {
           return;
         }
         resolvedVideoUrl = maybeVideoUrl.replaceAll('&amp;', '&');
-        final rawAudioRep = DashParser.bestAudio(effectiveMpd);
-        audioUrl = (rawAudioRep?.baseUrl ?? DashParser.extractAudioUrl(effectiveMpd))?.replaceAll('&amp;', '&');
+
+        // Extract distinct audio track
+        final audioReps = DashParser.parseAudio(effectiveMpd);
+        final distinctAudio = audioReps.where((a) => a.baseUrl.replaceAll('&amp;', '&') != resolvedVideoUrl).toList();
+        if (distinctAudio.isNotEmpty) {
+          audioUrl = distinctAudio.first.baseUrl.replaceAll('&amp;', '&');
+        } else {
+          final rawAudioRep = DashParser.bestAudio(effectiveMpd);
+          final bestUrl = rawAudioRep?.baseUrl.replaceAll('&amp;', '&');
+          if (bestUrl != null && bestUrl != resolvedVideoUrl) {
+            audioUrl = bestUrl;
+          } else {
+            final extracted = DashParser.extractAudioUrl(effectiveMpd)?.replaceAll('&amp;', '&');
+            if (extracted != null && extracted != resolvedVideoUrl) {
+              audioUrl = extracted;
+            }
+          }
+        }
 
         if (audioUrl == null) {
           final rewrittenMpd = await CdnService.raceAndRewriteMpd(
             effectiveMpd,
             fbCdnEnabled: p.fbCdnEnabled,
           );
-          final rewrittenAudio = DashParser.bestAudio(rewrittenMpd);
-          audioUrl = (rewrittenAudio?.baseUrl ?? DashParser.extractAudioUrl(rewrittenMpd))?.replaceAll('&amp;', '&');
+          final rewrittenAudioReps = DashParser.parseAudio(rewrittenMpd);
+          final rewrittenDistinct = rewrittenAudioReps.where((a) => a.baseUrl.replaceAll('&amp;', '&') != resolvedVideoUrl).toList();
+          if (rewrittenDistinct.isNotEmpty) {
+            audioUrl = rewrittenDistinct.first.baseUrl.replaceAll('&amp;', '&');
+          } else {
+            final rewrittenAudio = DashParser.bestAudio(rewrittenMpd);
+            final rewrittenUrl = rewrittenAudio?.baseUrl.replaceAll('&amp;', '&');
+            if (rewrittenUrl != null && rewrittenUrl != resolvedVideoUrl) {
+              audioUrl = rewrittenUrl;
+            } else {
+              final extracted = DashParser.extractAudioUrl(rewrittenMpd)?.replaceAll('&amp;', '&');
+              if (extracted != null && extracted != resolvedVideoUrl) {
+                audioUrl = extracted;
+              }
+            }
+          }
+        }
+
+        if (audioUrl != null) {
+          audioUrl = (await CdnService.raceAndRewrite(
+            audioUrl,
+            fbCdnEnabled: p.fbCdnEnabled,
+          )).replaceAll('&amp;', '&');
         }
       } else {
         resolvedVideoUrl = (await CdnService.raceAndRewrite(
@@ -746,11 +783,41 @@ class DownloadService {
             .toList();
         for (final file in files) {
           final name = file.uri.pathSegments.last;
-          if (existingPaths.contains(file.path) ||
-              existingNames.contains(name.toLowerCase()) ||
-              activePaths.contains(file.path)) {
+          if (activePaths.contains(file.path)) continue;
+
+          final existingRecord = existing.cast<DownloadRecord?>().firstWhere(
+            (e) => e != null && (e.filePath == file.path || e.filePath.split('/').last.toLowerCase() == name.toLowerCase()),
+            orElse: () => null,
+          );
+
+          if (existingRecord != null) {
+            // Check if existing record is missing thumbnail
+            if (existingRecord.thumbnailPath == null || !File(existingRecord.thumbnailPath!).existsSync()) {
+              try {
+                final thumbsDir = await _thumbnailsDirectory();
+                final candidatePath = '${thumbsDir.path}/${existingRecord.id}.jpg';
+                final ok = await _mediaChannel.invokeMethod<bool>('thumbnail', {
+                      'videoPath': file.path,
+                      'outputPath': candidatePath,
+                      'timeUs': 1000000,
+                    }) ??
+                    false;
+                if (ok && await File(candidatePath).exists() && (await File(candidatePath).length()) > 0) {
+                  await DownloadLibraryService.instance.update(DownloadRecord(
+                    id: existingRecord.id,
+                    title: existingRecord.title,
+                    filePath: existingRecord.filePath,
+                    durationMs: existingRecord.durationMs,
+                    thumbnailPath: candidatePath,
+                    isDash: existingRecord.isDash,
+                    downloadedAtMs: existingRecord.downloadedAtMs,
+                  ));
+                }
+              } catch (_) {}
+            }
             continue;
           }
+
           final title =
               name.contains('.') ? name.substring(0, name.lastIndexOf('.')) : name;
           final id = 'scan_${file.path.hashCode.abs()}';
@@ -771,7 +838,7 @@ class DownloadService {
                   'timeUs': 1000000,
                 }) ??
                 false;
-            if (ok && await File(candidatePath).exists()) {
+            if (ok && await File(candidatePath).exists() && (await File(candidatePath).length()) > 0) {
               thumbnailPath = candidatePath;
             }
           } catch (_) {}
@@ -815,7 +882,7 @@ class DownloadService {
             'timeUs': 1000000,
           }) ??
           false;
-      if (ok && await File(candidatePath).exists()) {
+      if (ok && await File(candidatePath).exists() && (await File(candidatePath).length()) > 0) {
         thumbnailPath = candidatePath;
       }
     } catch (_) {}
@@ -834,8 +901,19 @@ class DownloadService {
     }
 
     final existingRecords = await DownloadLibraryService.instance.loadAll();
-    final alreadyExists = existingRecords.any((r) => r.filePath == filePath || r.id == id);
-    if (!alreadyExists) {
+    final matchIndex = existingRecords.indexWhere((r) => r.filePath == filePath || r.id == id);
+    if (matchIndex >= 0) {
+      final old = existingRecords[matchIndex];
+      await DownloadLibraryService.instance.update(DownloadRecord(
+        id: old.id,
+        title: old.title,
+        filePath: old.filePath,
+        durationMs: old.durationMs > 0 ? old.durationMs : resolvedDuration,
+        thumbnailPath: thumbnailPath ?? old.thumbnailPath,
+        isDash: old.isDash,
+        downloadedAtMs: old.downloadedAtMs,
+      ));
+    } else {
       await DownloadLibraryService.instance.add(DownloadRecord(
         id: id,
         title: title,
