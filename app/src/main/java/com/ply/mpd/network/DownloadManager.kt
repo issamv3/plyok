@@ -429,109 +429,33 @@ class DownloadManager private constructor(private val context: Context) {
             val audioTrackOut = muxer.addTrack(audioFormat!!)
             muxer.start()
 
-            videoExtractor.selectTrack(videoTrackIn)
-            audioExtractor.selectTrack(audioTrackIn)
-
-            var maxInputSize = 4 * 1024 * 1024
-            if (videoFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                val s = videoFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
-                if (s > maxInputSize) maxInputSize = s
-            }
-            if (audioFormat.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                val s = audioFormat.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
-                if (s > maxInputSize) maxInputSize = s
-            }
-            val buffer = ByteBuffer.allocateDirect(maxInputSize)
+            val bufSize = 1 * 1024 * 1024
+            val buffer = ByteBuffer.allocate(bufSize)
             val bufferInfo = MediaCodec.BufferInfo()
 
-            val vStartPts = videoExtractor.sampleTime.let { if (it >= 0L) it else 0L }
-            val aStartPts = audioExtractor.sampleTime.let { if (it >= 0L) it else 0L }
-
-            var videoEos = false
-            var audioEos = false
+            videoExtractor.selectTrack(videoTrackIn)
             var videoSamplesWritten = 0
+            while (true) {
+                bufferInfo.size = videoExtractor.readSampleData(buffer, 0)
+                if (bufferInfo.size < 0) break
+                bufferInfo.presentationTimeUs = videoExtractor.sampleTime
+                bufferInfo.flags = videoExtractor.sampleFlags
+                muxer.writeSampleData(videoTrackOut, buffer, bufferInfo)
+                videoSamplesWritten++
+                videoExtractor.advance()
+            }
+
             var audioSamplesWritten = 0
-            var lastVideoPts = -1L
-            var lastAudioPts = -1L
-
-            while (!videoEos || !audioEos) {
-                val vTime = if (!videoEos) {
-                    val st = videoExtractor.sampleTime
-                    if (st < 0L) {
-                        videoEos = true
-                        Long.MAX_VALUE
-                    } else {
-                        maxOf(0L, st - vStartPts)
-                    }
-                } else {
-                    Long.MAX_VALUE
-                }
-
-                val aTime = if (!audioEos) {
-                    val st = audioExtractor.sampleTime
-                    if (st < 0L) {
-                        audioEos = true
-                        Long.MAX_VALUE
-                    } else {
-                        maxOf(0L, st - aStartPts)
-                    }
-                } else {
-                    Long.MAX_VALUE
-                }
-
-                if (videoEos && audioEos) break
-
-                val writeVideo = when {
-                    videoEos -> false
-                    audioEos -> true
-                    vTime <= aTime -> true
-                    else -> false
-                }
-
-                if (writeVideo) {
-                    buffer.clear()
-                    val sampleSize = videoExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0) {
-                        videoEos = true
-                    } else {
-                        val rawPts = videoExtractor.sampleTime
-                        var pts = if (rawPts >= vStartPts) rawPts - vStartPts else maxOf(0L, rawPts)
-                        if (pts <= lastVideoPts) {
-                            pts = lastVideoPts + 1000L
-                        }
-                        lastVideoPts = pts
-
-                        bufferInfo.offset = 0
-                        bufferInfo.size = sampleSize
-                        bufferInfo.presentationTimeUs = pts
-                        bufferInfo.flags = videoExtractor.sampleFlags
-
-                        muxer.writeSampleData(videoTrackOut, buffer, bufferInfo)
-                        videoSamplesWritten++
-                        videoExtractor.advance()
-                    }
-                } else {
-                    buffer.clear()
-                    val sampleSize = audioExtractor.readSampleData(buffer, 0)
-                    if (sampleSize < 0) {
-                        audioEos = true
-                    } else {
-                        val rawPts = audioExtractor.sampleTime
-                        var pts = if (rawPts >= aStartPts) rawPts - aStartPts else maxOf(0L, rawPts)
-                        if (pts <= lastAudioPts) {
-                            pts = lastAudioPts + 500L
-                        }
-                        lastAudioPts = pts
-
-                        bufferInfo.offset = 0
-                        bufferInfo.size = sampleSize
-                        bufferInfo.presentationTimeUs = pts
-                        bufferInfo.flags = audioExtractor.sampleFlags
-
-                        muxer.writeSampleData(audioTrackOut, buffer, bufferInfo)
-                        audioSamplesWritten++
-                        audioExtractor.advance()
-                    }
+            if (audioTrackIn >= 0 && audioTrackOut >= 0) {
+                audioExtractor.selectTrack(audioTrackIn)
+                while (true) {
+                    bufferInfo.size = audioExtractor.readSampleData(buffer, 0)
+                    if (bufferInfo.size < 0) break
+                    bufferInfo.presentationTimeUs = audioExtractor.sampleTime
+                    bufferInfo.flags = audioExtractor.sampleFlags
+                    muxer.writeSampleData(audioTrackOut, buffer, bufferInfo)
+                    audioSamplesWritten++
+                    audioExtractor.advance()
                 }
             }
 

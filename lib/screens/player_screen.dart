@@ -827,6 +827,25 @@ class _PlayerScreenState extends State<PlayerScreen>
         }
       } catch (_) {}
     }
+    if (thumbnailPath == null) {
+      try {
+        final boundary = _videoBoundaryKey.currentContext?.findRenderObject()
+            as RenderRepaintBoundary?;
+        if (boundary != null) {
+          final image = await boundary.toImage(pixelRatio: 0.6);
+          final byteData =
+              await image.toByteData(format: ui.ImageByteFormat.png);
+          image.dispose();
+          if (byteData != null) {
+            final thumbsDir = await DownloadService.getThumbnailsDirectory();
+            final file = File(
+                '${thumbsDir.path}/thumb_${DateTime.now().millisecondsSinceEpoch}.png');
+            await file.writeAsBytes(byteData.buffer.asUint8List());
+            thumbnailPath = file.path;
+          }
+        }
+      } catch (_) {}
+    }
     DownloadService.startBackground(
       title: title,
       isDash: widget.isDash,

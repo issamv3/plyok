@@ -447,22 +447,23 @@ class DownloadService {
 
       final isDash = p.isDash || (effectiveMpd != null && effectiveMpd.contains('<MPD'));
       if (isDash && effectiveMpd != null) {
-        final rewrittenMpd = await CdnService.raceAndRewriteMpd(
-          effectiveMpd,
-          fbCdnEnabled: p.fbCdnEnabled,
-        );
-        final videoReps = DashParser.parse(rewrittenMpd);
-        final maybeVideoUrl = resolveVideoUrl(videoReps, p.selectedVideoRep);
+        final rawVideoReps = DashParser.parse(effectiveMpd);
+        final maybeVideoUrl = resolveVideoUrl(rawVideoReps, p.selectedVideoRep);
         if (maybeVideoUrl == null) {
           await NotificationService.showError(title, 'No video track found');
           return;
         }
         resolvedVideoUrl = maybeVideoUrl.replaceAll('&amp;', '&');
-        final audioRep = DashParser.bestAudio(rewrittenMpd) ?? DashParser.bestAudio(effectiveMpd);
-        if (audioRep != null) {
-          audioUrl = audioRep.baseUrl.replaceAll('&amp;', '&');
-        } else {
-          audioUrl = (DashParser.extractAudioUrl(rewrittenMpd) ?? DashParser.extractAudioUrl(effectiveMpd))?.replaceAll('&amp;', '&');
+        final rawAudioRep = DashParser.bestAudio(effectiveMpd);
+        audioUrl = (rawAudioRep?.baseUrl ?? DashParser.extractAudioUrl(effectiveMpd))?.replaceAll('&amp;', '&');
+
+        if (audioUrl == null) {
+          final rewrittenMpd = await CdnService.raceAndRewriteMpd(
+            effectiveMpd,
+            fbCdnEnabled: p.fbCdnEnabled,
+          );
+          final rewrittenAudio = DashParser.bestAudio(rewrittenMpd);
+          audioUrl = (rewrittenAudio?.baseUrl ?? DashParser.extractAudioUrl(rewrittenMpd))?.replaceAll('&amp;', '&');
         }
       } else {
         resolvedVideoUrl = (await CdnService.raceAndRewrite(
@@ -686,6 +687,7 @@ class DownloadService {
       return dir;
     }
   }
+  static Future<Directory> getThumbnailsDirectory() => _thumbnailsDirectory();
   static Future<Directory> _thumbnailsDirectory() async {
     try {
       final docs = await getApplicationDocumentsDirectory();
